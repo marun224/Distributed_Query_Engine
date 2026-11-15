@@ -1,0 +1,6 @@
+# Normalise line endings in the repo; files that run inside Linux keep LF on Windows checkouts
+# too (they are bind-mounted into the dev container, PLAN decision 28).
+* text=auto
+*.sh text eol=lf
+Dockerfile text eol=lf
+*.yml text eol=lf

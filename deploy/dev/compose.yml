@@ -1,0 +1,42 @@
+# icefleet dev container (PLAN decision 28). Driven by scripts\dev.ps1:
+#   .\scripts\dev.ps1 up        build + start      .\scripts\dev.ps1 setup    create the venv
+#   .\scripts\dev.ps1 <cmd>     run in the container, e.g. .\scripts\dev.ps1 uv run tox
+#
+# It joins the dev catalog's Docker network so the REST catalog and MinIO are reachable by
+# name. Credentials still come from the repo's .env (icetl reads /work/.env); only the two
+# host names are overridden here, because process env outranks .env.
+
+name: icefleet-dev
+
+services:
+  dev:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: icefleet-dev:local
+    container_name: icefleet-dev
+    init: true
+    working_dir: /work
+    volumes:
+      - ../..:/work
+      - venv:/opt/venv
+      - cache:/cache
+      - ../../.wheelhouse:/wheelhouse:ro
+    environment:
+      ICETL_CATALOG_URI: http://iceberg-rest:8181
+      ICETL_S3_ENDPOINT: http://minio:9000
+    networks:
+      - default
+      - catalog
+
+networks:
+  catalog:
+    # The dev catalog's compose network (PLAN §3.4). Override if that stack is renamed.
+    name: ${ICEFLEET_DEV_CATALOG_NETWORK:-iceberg-nyc_iceberg_net}
+    external: true
+
+volumes:
+  venv:
+    name: icefleet-dev-venv
+  cache:
+    name: icefleet-dev-cache

@@ -1,0 +1,17 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.hypothesis/
+.tox/
+dist/
+build/
+*.egg-info/
+.env
+.scratch/
+.wheelhouse/
+.ipynb_checkpoints/
+.idea/
+*.iml

@@ -1,0 +1,96 @@
+[project]
+name = "icefleet"
+version = "0.0.1"
+description = "Distributed SQL and DataFrame engine over Apache Iceberg, executed by a fleet of DuckDB workers"
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+authors = [{ name = "Arun M" }]
+license = "Apache-2.0"
+keywords = ["iceberg", "duckdb", "distributed", "sql", "dataframe", "sqlglot", "pyiceberg", "lakehouse"]
+classifiers = [
+  "Development Status :: 2 - Pre-Alpha",
+  "Intended Audience :: Developers",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Database :: Database Engines/Servers",
+  "Typing :: Typed",
+]
+# icetl is pinned *exactly*: icefleet overrides private Session seams (PLAN 4.10), and every
+# pin bump must go through py_test/test_seams.py. The engine libraries carry icetl's own ranges
+# so one resolver answer satisfies both packages.
+dependencies = [
+  "icetl==0.1.0",
+  "pyiceberg[s3fs,pyarrow,sql-sqlite,glue,hive]>=0.11.1,<0.12",
+  "duckdb>=1.5.5,<2",
+  "sqlglot>=30.17.0,<31",
+  "pyarrow>=25.0.1",
+  "s3fs>=2024.6",
+  "cloudpickle>=3.0",
+  "python-dotenv>=1.0",
+  "rich>=13.0",
+]
+
+[project.optional-dependencies]
+notebook = ["ipykernel>=6.29", "jupyterlab>=4.2"]
+dev = ["pytest>=8", "pytest-cov", "ruff", "mypy", "hypothesis"]
+
+[project.scripts]
+icefleet-worker = "icefleet.worker.cli:main"
+
+# Installed by `uv sync` without any flag. `uv` itself is declared (and pinned to the
+# version bootstrapped into the venv) so an exact sync never uninstalls the running binary.
+[dependency-groups]
+dev = ["tox>=4.21", "tox-uv>=1.16", "uv==0.13.8"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.uv]
+package = true
+
+[tool.hatch.build.targets.wheel]
+packages = ["py_src/icefleet"]
+
+# ---------------------------------------------------------------------------
+# Tooling -- every path below is one of py_src / py_test / scripts, or the gate
+# silently checks nothing (workflow_instructions_file.md, Layout).
+# ---------------------------------------------------------------------------
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["py_src", "py_test", "scripts"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM", "RUF"]
+
+[tool.ruff.lint.per-file-ignores]
+"py_src/icefleet/**/__init__.py" = ["F401"]
+
+[tool.mypy]
+python_version = "3.12"
+files = ["py_src", "py_test"]
+mypy_path = "py_src"
+explicit_package_bases = true
+disallow_untyped_defs = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+no_implicit_optional = true
+strict_equality = true
+
+[[tool.mypy.overrides]]
+module = ["duckdb.*", "pyiceberg.*", "pyarrow.*", "sqlglot.*", "s3fs.*", "cloudpickle.*"]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["py_test"]
+markers = [
+  "integration: needs the dev REST catalog + MinIO (deselected by default)",
+  "slow: an integration test that scans at real scale; minutes, not seconds",
+]
+#   pytest                                  offline suite: local[N] workers, sqlite catalog
+#   pytest -m "integration and not slow"    the dev catalog, bounded
+#   pytest -m integration                   everything, including the 41M-row scans
+addopts = "-m 'not integration' --strict-markers"
+filterwarnings = ["error::DeprecationWarning:icefleet.*"]
