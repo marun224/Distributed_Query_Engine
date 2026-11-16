@@ -6,14 +6,18 @@ sqlglot IR, PyIceberg planning and DuckDB execution, with queries cut into stage
 workers run at once.
 
 ```python
-from icefleet import ClusterSession  # Phase 1
+from icefleet import ClusterSession
 from icetl.sql import functions as F
 
 session = ClusterSession.builder.config("icefleet.master", "local[4]").getOrCreate()
-session.table("nyc.yellow_tripdata").groupBy("VendorID").agg(F.sum("total_amount")).show()
+df = session.table("nyc.yellow_tripdata").filter(F.col("trip_distance") > 50)
+df.explain()  # == Distributed Plan ==: the stage, its splits, or why it runs single-node
+df.toArrow()  # the same rows icetl returns on one machine
 ```
 
-**Status: Phase 0 (scaffold).** The design is in
+**Status: Phase 1 built.** Scan-only queries (filters, projections, expressions, `LIMIT`)
+run on a fleet of DuckDB workers (`local[N]`, `static://`, `k8s://`); everything else runs
+single-node through icetl and `explain()` says why. Aggregation is Phase 2. The design is in
 [docs/PLAN_distributed_engine.md](docs/PLAN_distributed_engine.md); what is done is in
 [docs/task_tracker.md](docs/task_tracker.md); how work runs is in
 [docs/workflow_instructions_file.md](docs/workflow_instructions_file.md).

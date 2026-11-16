@@ -197,3 +197,79 @@ Get-Item .venv, ... | % LastWriteTime; (Get-ChildItem -Recurse -File .tox).Count
 ```bash
 .venv/Scripts/python.exe <scratchpad>/confirm_phase0.py docs/task_tracker.md   # Phase 0 done + confirmed; decision 26 confirmed; next: Phase 1 kickoff questions
 ```
+
+## 2026-11-15 — Phase 1 kickoff answered ("yes to all"); Phase 0 committed; Phase 1 built
+
+```bash
+# Q6: rename the unborn branch to main, commit Phase 0 (owner asked). No git identity was
+# configured, so a repo-local one was set from pyproject's author and the owner's account email.
+git config --local user.name "Arun M"; git config --local user.email <owner's email>
+git symbolic-ref HEAD refs/heads/main
+git add -A; git status --short                     # 27 files, .env and caches excluded
+git commit -F - <<'EOF' ... EOF                    # 28554e2 "Phase 0: scaffold, design plan and Linux dev container"
+
+# Reading icetl 0.1.0's private surface before overriding it (read-only)
+find .venv/Lib/site-packages/icetl -name "*.py" | xargs wc -l
+grep -nE "^\s*(def|class) " sql/session.py exec/scan_planner.py exec/source_sql.py exec/result.py exec/engine.py
+grep -rnE "^def (substitute_sources|collect_source_keys|...)|^class (OptimizedPlan|PlanAnalyzer|...)"
+grep -nE "_execute\(|_stream\(|_compile\(|def (explain|toArrow|...)" sql/dataframe.py
+grep -nE "DataFrame\(self\._session|..." sql/dataframe.py; sed -n 1239,1275p sql/dataframe.py
+sed -n 1,87p paths.py; grep -nE "^class |^def |..." conf.py errors.py sql/udf.py
+ls E:/workspace/Transformation_Engine_08172026/tests     # icetl's fixtures, read to adapt (read-only)
+```
+
+```powershell
+# Spikes in the dev container (scripts in the scratchpad, docker cp'd to /tmp)
+docker cp <scratchpad>\copy_spike.py icefleet-dev:/tmp/; .\scripts\dev.ps1 uv run python /tmp/copy_spike.py
+#   COPY to a file needs its parent dir; RETURN_STATS -> (filename, count, file_size_bytes, ...);
+#   zero rows still writes one typed file; directory target + FILE_SIZE_BYTES works;
+#   parquet changes the Arrow type of HUGEINT, UHUGEINT, TIMESTAMP_S/_MS, INTEGER[n], ENUM, BIT, VARINT, UNION
+docker cp <scratchpad>\compile_probe.py icefleet-dev:/tmp/; .\scripts\dev.ps1 uv run python /tmp/compile_probe.py
+#   icetl's optimized tree for a scan-only query is one flat SELECT; compiled SQL reads $<view>_paths_0;
+#   COPY (... read_parquet($p) ...) accepts the named list parameter
+
+# Building: lint / type / tests, iterated
+.\scripts\dev.ps1 uv run python -m ruff check py_src; ... ruff format --check py_src; ... mypy py_src
+.\scripts\dev.ps1 uv run python -m ruff format py_src; ... ruff check --fix py_src --output-format concise
+.\scripts\dev.ps1 uv run python -m pytest -q -x -p no:randomly   # 1 failed: id < 0 is pruned to no files by Iceberg stats -> single-node (test fixed)
+.\scripts\dev.ps1 uv run python -m pytest -q -p no:randomly      # 178 passed in 116.8 s
+.\scripts\dev.ps1 uv run python -m ruff format .; ... ruff check . --output-format concise; ... mypy
+.\scripts\dev.ps1 uv run tox                                     # lint FAIL (smoke script formatting), type/py312/dist OK
+.\scripts\dev.ps1 uv run python -m ruff format .                 # 1 file reformatted
+.\scripts\dev.ps1 uv run python scripts/smoke_cluster.py         # created bucket icefleet-shuffle; 13/62 files, 4 splits,
+                                                                 # 6485 rows identical to icetl; prefix removed. 9.4 s cold, 1.0 s warm, icetl 2.7 s
+.\scripts\dev.ps1 uv run tox                                     # lint/type/py312/dist OK, 87.8 s
+.\scripts\dev.ps1 uv run python -m pytest -q -p no:randomly      # 178 passed in 111.8 s
+# after capping the worker's remembered cancellations:
+.\scripts\dev.ps1 uv run python -m ruff check py_src; ... ruff format --check py_src; ... mypy
+.\scripts\dev.ps1 uv run python -m pytest -q -p no:randomly py_test/unit/test_worker_server.py py_test/cluster/test_behaviour.py   # 21 passed
+
+# Tracker updated with a scratchpad script (phase1_tracker.py); plan v1.3, README by hand
+.venv/Scripts/python.exe <scratchpad>/phase1_tracker.py docs/task_tracker.md
+```
+
+```powershell
+# Final gate: lint failed once more because ruff also formats Python blocks inside Markdown
+# (the new README example's comment spacing)
+.\scripts\dev.ps1 uv run tox                       # lint FAIL; type/py312/dist OK
+.\scripts\dev.ps1 uv run python -m ruff check . --output-format concise; ... ruff format --check .   # README.md
+.\scripts\dev.ps1 uv run python -m ruff format .   # 1 file reformatted (README.md)
+.\scripts\dev.ps1 uv run tox                       # lint/type/py312/dist OK, 86.0 s  -- Phase 1 gate green
+git status --short
+```
+
+## 2026-11-15 — paused by the owner
+
+```bash
+git remote -v; git log --oneline -3; git branch -vv   # no remote; 28554e2 on main only, local
+```
+Tracker updated by hand: paused, three open questions (confirm Phase 1, commit it, GitHub remote).
+
+## 2026-11-16 — resumed: orientation only (read-only, nothing built or run in the container)
+
+```bash
+wc -l docs/*.md README.md pyproject.toml; ls -R py_src py_test scripts deploy
+tail -60 docs/commands.md; git status --short; git diff --stat
+wc -l py_src/icefleet/*.py py_src/icefleet/*/*.py
+grep -nE "^(class|def) |^    def " py_src/icefleet/session.py py_src/icefleet/plan/stages.py py_src/icefleet/scheduler/base.py
+```

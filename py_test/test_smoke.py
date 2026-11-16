@@ -77,26 +77,22 @@ def test_worker_cli_help(capsys: pytest.CaptureFixture[str]) -> None:
         main(["--help"])
     assert exc.value.code == 0
     out = capsys.readouterr().out
-    assert "icefleet-worker" in out
-    flags = (
-        "--host",
-        "--port",
-        "--slots",
-        "--memory-limit",
-        "--threads",
-        "--temp-dir",
-        "--exchange",
-    )
-    for flag in flags:
+    assert "icefleet-worker" in out and "serve" in out and "run-task" in out
+
+    with pytest.raises(SystemExit) as exc:
+        main(["serve", "--help"])
+    assert exc.value.code == 0
+    out = capsys.readouterr().out
+    for flag in ("--host", "--port", "--slots", "--memory-limit", "--threads", "--temp-dir"):
         assert flag in out
 
 
 def test_worker_cli_defaults() -> None:
-    args = build_parser().parse_args([])
+    args = build_parser().parse_args(["serve"])
     assert (args.host, args.port, args.slots) == ("127.0.0.1", 8815, 2)
-    assert args.memory_limit is None and args.exchange is None
+    assert args.memory_limit is None and args.port_file is None
 
 
-def test_worker_cli_has_no_server_yet(capsys: pytest.CaptureFixture[str]) -> None:
-    assert main(["--port", "9000"]) == EXIT_NOT_IMPLEMENTED
-    assert "Phase 1" in capsys.readouterr().err
+def test_worker_cli_without_a_subcommand_prints_help(capsys: pytest.CaptureFixture[str]) -> None:
+    assert main([]) == EXIT_NOT_IMPLEMENTED
+    assert "serve" in capsys.readouterr().err

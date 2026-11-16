@@ -1,6 +1,6 @@
 # icefleet — a distributed SQL and DataFrame engine over Apache Iceberg, executed by a fleet of DuckDB workers
 
-**Status:** Draft v1.2 — 2026-11-15, decisions locked (§2); v1.1 adds decision 26 (HTTP control plane) and decision 27 (Kubernetes + Argo Workflows as the deployment target); v1.2 adds decision 28 (development in a Linux dev container)
+**Status:** Draft v1.3 — 2026-11-15, decisions locked (§2); v1.1 adds decision 26 (HTTP control plane) and decision 27 (Kubernetes + Argo Workflows as the deployment target); v1.2 adds decision 28 (development in a Linux dev container); v1.3 records Phase 1 as built (§6), corrects §4.6 (DuckDB writes field ids) and extends the seam table (§4.10)
 **Owner:** Arun
 **Base:** [`icetl`](https://github.com/marun224/data_transformation_engine) 0.1.0 — single-node, sqlglot IR, PyIceberg planning, DuckDB execution. Local checkout: `E:\workspace\Transformation_Engine_08172026`.
 **State of the work:** [task_tracker.md](task_tracker.md). This file is the design; it does not say what is done.
@@ -372,6 +372,8 @@ The final stage's sink is `iceberg_files`:
 
 Why field ids matter enough to write them ourselves: DuckDB's `COPY` does not write them, and a file without them is correct only through a name mapping that not every reader honours.
 
+> **Correction, 2026-11-15 (owner agreed at the Phase 1 kickoff):** DuckDB 1.5.6's `COPY ... (FORMAT parquet, FIELD_IDS {col: id, ...})` *does* write `PARQUET:field_id` (measured: `parquet_schema()` reads them back). So Phase 5 should write data files with DuckDB, which keeps P4 and keeps pyarrow's Parquet writer off the workers. Steps 2–3 above become `COPY ... FIELD_IDS` with `FILE_SIZE_BYTES` rolling and `RETURN_STATS` for the manifest; nested field ids use DuckDB's `__duckdb_field_id` form. To be confirmed against `add_files` and icetl's rename detection in Phase 5.
+
 ### 4.7 Semantics under distribution
 
 - Spark 3.5 remains the reference, inherited through icetl's conformance pass, which runs on the whole tree *before* cutting. A stage never sees an unconformed expression.
@@ -411,6 +413,10 @@ Overridden (private, which is why the pin is exact):
 | `Session._compile` | called unchanged, then its `optimized` tree and `scans` are consumed | expose `CompiledPlan` as public |
 | `DataFrame.write` → `DataFrameWriter._save` | a `ClusterDataFrameWriter` that compiles to an `iceberg_files` sink (Phase 5) | icetl 0.2.0: `Session._writer_class` hook |
 | `exec.scan_planner._selected_field_ids` and friends | copied, not imported, for split sizing (small, pure) | make public |
+| `DataFrame._explain_text` *(added 2026-11-15, Phase 1)* | wrapped at import: frames of a `ClusterSession` get the `== Distributed Plan ==` section first; every other frame unchanged. A subclass cannot do it, because icetl derives every new frame as a plain `DataFrame` | icetl 0.2.0: an explain hook on the `Executor` protocol |
+| `Session.Builder.getOrCreate` / `create`, `Session._active` *(Phase 1)* | `ClusterSession.Builder` subclasses them so the builder makes a `ClusterSession` (icetl's hard-codes `Session(...)`) | `Session._builder_class` or `cls(...)` in the builder |
+| `Session._analyzer.connection`, `Session._udf`, `Session._engine` *(Phase 1, read only)* | `DESCRIBE` of the output types (the parquet-safety check, §4.4); UDF names (a UDF call is uncuttable); the coordinator's DuckDB reads the result | part of the `Executor` context |
+| per-file sizes inside `plan_scan` *(Phase 1)* | not reachable, so `plan/splits.py` lists the scan's files again from the manifests (one extra metadata pass on the coordinator) | `ScanPlan` keeps per-file sizes |
 
 Each upstream hook is a small, additive PR to the icetl repo and a version bump of the pin. Until then: `icetl==0.1.0`, and `py_test/test_seams.py` asserts every private attribute icefleet touches still exists with the expected signature, so a pin bump fails loudly rather than mysteriously.
 
@@ -424,6 +430,7 @@ py_src/icefleet/
   session.py             ClusterSession(icetl.sql.Session)
   config.py              icefleet.* settings on top of icetl's conf
   errors.py              Uncuttable, ClusterError, WorkerError
+  _versions.py           the handshake's versions and protocol number
   plan/
     rel.py               RelNode types; from_sqlglot / to_sqlglot
     partitioning.py      Hash / Single / Broadcast / Range, requirement rules
@@ -514,6 +521,17 @@ a feeling.
 - `py_test/test_seams.py`.
 
 **Done when:** the oracle suite passes on `local[2]` and `local[3]`; `smoke_cluster.py` matches icetl on the real table; `uv run tox` green; tracker updated.
+
+**As built (2026-11-15).** Where the build differs from the list above or adds to it:
+
+- **Kickoff answers (owner, "yes to all"):** worker subcommands `serve` / `run-task` now (`run-task` exits 2, "Phase 6b"); bytes in the task JSON as base64 (`InputSpec.schema_ipc`, unused until Phase 2); §4.6 corrected (DuckDB writes field ids); the icetl hooks PR after Phase 5; the `icefleet-shuffle` bucket may be created; Phase 0 committed on `main` first.
+- **CLI:** `--exchange` dropped (the sink location travels in each `TaskSpec`); `--port-file` (how `local[N]` learns a port-0 worker's port) and `--log-level` added.
+- **Stage SQL is icetl's compiled SQL, unchanged.** The scan's file list is already a `$<view>_paths_0` parameter there; each task binds it to its split. Nothing is re-rendered.
+- **Result sink:** `COPY (...) TO '<task dir>' (FORMAT parquet, COMPRESSION zstd, FILE_SIZE_BYTES n, RETURN_STATS true)`. `RETURN_STATS` (not `RETURN_FILES`) gives rows and bytes per file, so the manifest needs no listing, even on S3. A zero-row task still writes one typed file. DuckDB creates the task directory but not its parents, so the worker creates those for a local exchange.
+- **Parquet-unsafe result types run single-node** (new rule, §4.4): `HUGEINT`, `UHUGEINT`, `TIMESTAMP_S/_MS`, fixed-size arrays, `ENUM`, `BIT`, `VARINT`, `UNION` change Arrow type through parquet (measured on DuckDB 1.5.6, pinned by `py_test/unit/test_result_types.py`). Phase 2 must cast partials of these types (e.g. `sum()` of an integer is `HUGEINT`) before they enter a shuffle.
+- **Also single-node:** a scan pruned to no files (nothing to distribute), more than one file group (renamed or late-added columns; Phase 7), duplicate output names, a Python UDF call. A *single* group that needs aliasing is cut, because every split runs identical SQL.
+- **Config keys** beyond §2: `icefleet.split.targetBytes`, `.split.max`, `.worker.slots`, `.local.threads`, `.local.memoryLimit`, `.result.maxBytes`, `.result.fileBytes`, `.task.timeoutSeconds`, `.worker.startupTimeoutSeconds` (all in `icefleet/config.py` with their environment names).
+- **Proof of life:** `scripts/smoke_cluster.py` on `nyc.yellow_tripdata`: 13 of 62 files after pruning, 4 splits on `local[2]`, 6,485 rows identical to icetl, exchange prefix removed.
 
 ### Phase 2 — Exchange and aggregation
 

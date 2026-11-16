@@ -9,18 +9,18 @@ Update at the end of every session. Design lives in
 | | |
 |---|---|
 | Last updated | 2026-11-15 |
-| Current phase | **Phase 0 — Scaffold: done, confirmed by the owner 2026-11-15** (with decisions 26 and 28) |
-| Next action | Phase 1 kickoff: the owner answers the up-front questions (asked 2026-11-15) → build Phase 1 |
-| Next phase | Phase 1 — Worker, control plane, scan-only queries, `local[N]` |
-| Blocked on | Owner's answers to the Phase 1 kickoff questions |
-| Gate | **`.\scripts\dev.ps1 uv run tox` green on 2026-11-15** in the dev container, both setup modes: lint · type · py312 8 passed 0 skipped · dist (online mode 11 s warm). The Windows `.venv` gate is red (Smart App Control) and **no longer authoritative** (decision 28) |
+| Current phase | **Phase 1 — Worker, control plane, scan-only queries, `local[N]`: built, gate green, awaiting owner confirmation** |
+| Next action | **Paused by the owner 2026-11-15.** On resume, three questions are open: (1) confirm Phase 1? (2) commit Phase 1? (3) push to GitHub: an existing repo URL, or create one (private recommended)? Then the Phase 2 kickoff questions |
+| Next phase | Phase 2 — Exchange (shuffle) and two-phase aggregation |
+| Blocked on | Owner confirmation only |
+| Gate | **`.\scripts\dev.ps1 uv run tox` green on 2026-11-15** (Phase 1): lint · type · py312 **178 passed** · dist, ~90 s. Proof of life `scripts/smoke_cluster.py` on the dev catalog: **OK**. The Windows `.venv` gate is not authoritative (decision 28) |
 
 ## Phases
 
 | Phase | Scope (plan §6) | Status | Done on | Confirmed by owner |
 |---|---|---|---|---|
 | 0 | Scaffold: venv, uv, pyproject, tox gate, docs, smoke tests | **done** | 2026-11-15 | **yes, 2026-11-15** |
-| 1 | Worker (HTTP), `local[N]`, splits, scan-only stages, fallback, proof of life on the dev catalog | not started | — | — |
+| 1 | Worker (HTTP), `local[N]`, splits, scan-only stages, fallback, proof of life on the dev catalog | **built — awaiting confirmation** | 2026-11-15 | pending |
 | 2 | Exchange (shuffle) + two-phase aggregation + explain DAG | not started | — | — |
 | 3 | Joins: broadcast and shuffle hash | not started | — | — |
 | 4 | Windows, ORDER BY / LIMIT, set operations, grouping sets | not started | — | — |
@@ -45,6 +45,25 @@ Update at the end of every session. Design lives in
 | 0.10 | Linux dev container (decision 28, [PLAN_linux_dev_environment.md](PLAN_linux_dev_environment.md)) | **done** | owner approved "yes to all"; `deploy/dev/`, `scripts/dev.ps1`, `scripts/wheelhouse.ps1`, `.gitattributes`, `tox.ini` `work_dir`; docs updated. Verified: clean `up` + `setup` in both modes, tox green, catalog read through icetl, Windows `.venv`/`.tox` untouched (plan §11) |
 | 0.9 | Owner confirms Phase 0 | **done** | 2026-11-15, "go with your recommendation": Phase 0, decision 26 and decision 28 confirmed |
 
+## Phase 1 checklist
+
+| # | Task | Status | Notes |
+|---|---|---|---|
+| 1.0 | Kickoff questions (6) answered | **done** | owner: "yes to all" (2026-11-15); answers recorded in plan §6 Phase 1 "As built" |
+| 1.1 | Phase 0 committed on `main` | **done** | `28554e2`; branch renamed `master` → `main`; repo-local git identity set (none was configured) |
+| 1.2 | Worker: `serve` (stdlib HTTP `/ping` `/tasks` `/cancel`, slot semaphore), runner on icetl's `DuckDBEngine`, `result` sink | **done** | `worker/{cli,server,runner,sinks}.py`; `run-task` exits 2 ("Phase 6b"); `--exchange` dropped, `--port-file` / `--log-level` added |
+| 1.3 | Wire format `TaskSpec` / `TaskResult` | **done** | `plan/tasks.py`; base64 `schema_ipc` (Phase 2 will use it) |
+| 1.4 | Cluster: `local[N]` launcher, `static://`, `k8s://` (DNS, stubbed resolver test), handshake refusing a DuckDB/icefleet/protocol mismatch | **done** | `cluster/{launcher,discovery,client}.py`, `icefleet/_versions.py` |
+| 1.5 | Scheduler protocol + `ThreadPoolScheduler` | **done** | first failure cancels the rest (`/cancel`), error names worker and task |
+| 1.6 | Stage planner v1: `Project(Scan)` → one stage; everything else `Uncuttable` with the phase that will distribute it | **done** | `plan/{rel,stages}.py`; stage SQL = icetl's compiled SQL unchanged |
+| 1.7 | Split planner | **done** | `plan/splits.py`; LPT into `max(ceil(bytes/target), workers×slots)` splits; hypothesis property test |
+| 1.8 | Exchange: `LocalDirExchange`, `ObjectStoreExchange` (s3fs list/delete) | **done** | prefix deleted in a `finally`; `icefleet.exchange.keep` keeps it |
+| 1.9 | `ClusterSession`: builder, `icefleet.master`, fallback (`single-node` / `error`), `explain()` section, `toArrowBatches` streaming | **done** | `session.py`; `config.py` with conf > env > .env precedence |
+| 1.10 | Tests: oracle suite on `local[2]` and `local[3]`; explain ≥ 2 splits; GROUP BY falls back and says so; handshake refused; worker death fails cleanly; prefix gone; worker HTTP surface; `test_seams.py`; parquet type round-trip pinned | **done** | 178 tests, ~110 s offline |
+| 1.11 | `scripts/smoke_cluster.py` on `nyc.yellow_tripdata` | **done** | 13 of 62 files after pruning, 4 splits, 6,485 rows identical to icetl, prefix removed; 9.4 s cold (incl. worker start), 1.0 s warm, icetl 2.7 s (one run each, not a benchmark) |
+| 1.12 | Plan updated | **done** | v1.3: §4.6 correction (DuckDB writes field ids), §4.10 seams added, §6 Phase 1 "As built" |
+| 1.13 | Owner confirms Phase 1 | **pending** | |
+
 ## Open decisions
 
 - ~~Which dev Kubernetes cluster?~~ **Settled 2026-11-15: Docker Desktop's built-in
@@ -57,12 +76,13 @@ Update at the end of every session. Design lives in
   for multi-node or CI runs; the manifests are plain Kubernetes either way.
 - ~~Decision 26 needs the owner's eyes.~~ **Confirmed by the owner 2026-11-15** with Phase 0
   (HTTP/JSON control plane; Arrow IPC over HTTP for the Phase 8 data plane).
-- **git.** Repository initialised on branch `master`, every Phase 0 file staged, **no commit
-  yet** (`.env` correctly unstaged). The first commit happens only when the owner asks
-  (workflow rule). Phase 0's "green from a fresh clone" check cannot run until it exists.
-- **icetl upstream hooks.** Plan §4.10 lists the private seams icefleet will override. Whether
-  to open the `Executor` hook PR in icetl during Phase 1 or after Phase 5 is the owner's call;
-  until then the pin stays `icetl==0.1.0`.
+- **git.** Phase 0 committed (`28554e2`) on `main`, at the owner's request (2026-11-15).
+  **Phase 1 is not committed.** Its files show as staged; I didn't stage them, probably
+  VS Code did. **No remote**: nothing is on GitHub. The owner asked for the GitHub URL;
+  pushing needs either their repo URL or a `gh repo create` (private recommended). Undecided.
+  Commits and pushes happen only when the owner asks.
+- ~~icetl upstream hooks.~~ **Settled 2026-11-15: after Phase 5**, once every override is
+  known (plan §4.10 now lists six seams). The pin stays `icetl==0.1.0` until then.
 
 ## Deferred
 
@@ -100,6 +120,19 @@ None in the code — nothing runs yet. In the environment:
   blocked by default in a plain terminal). README gives
   `powershell -ExecutionPolicy Bypass -File .\scripts\dev.ps1 ...`; changing the policy is
   the owner's call.
+
+- **Phase 1 limits, by design (see plan §6 Phase 1 "As built"):** only `Project(Scan)`
+  distributes; result columns of a parquet-unsafe type, scans pruned to no files, renamed
+  columns across file groups, duplicate output names and UDF calls run single-node.
+- **Workers download DuckDB's `httpfs` on first object-store use** (`INSTALL httpfs`). In the
+  dev container that is an internet download, subject to the flaky-download problem above; it
+  worked on 2026-11-15. Phase 6 bakes it into the image (plan §3.5).
+- **No task timeout by default** (`icefleet.task.timeoutSeconds` unset): a worker that hangs
+  without dropping its connection hangs the query. A dead process is detected at once.
+  Liveness checks are Phase 7.
+- **Split sizing lists the manifests a second time** (one extra metadata pass on the
+  coordinator; icetl does not expose per-file sizes). Fine at 62 files; an icetl hook is on
+  the upstream list (plan §4.10).
 
 ## Environment facts (dev machine, 2026-11-15)
 
