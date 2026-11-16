@@ -273,3 +273,74 @@ tail -60 docs/commands.md; git status --short; git diff --stat
 wc -l py_src/icefleet/*.py py_src/icefleet/*/*.py
 grep -nE "^(class|def) |^    def " py_src/icefleet/session.py py_src/icefleet/plan/stages.py py_src/icefleet/scheduler/base.py
 ```
+
+## 2026-11-16 — push to GitHub (owner: new repo `Distributed_Query_Engine`, public, commit Phase 1 first)
+
+```bash
+gh --version; gh auth status                       # logged in as marun224, scopes repo/workflow
+git remote -v                                      # none
+git check-ignore -v .env .venv .tox                # all ignored
+git ls-remote https://github.com/marun224/icefleet.git   # not found
+git add -A --dry-run; git grep -nIiE "(secret|password|access_key|aws_secret|token)\s*[:=]..."   # nothing
+grep -E "KEY|SECRET|PASSWORD|TOKEN" .env | ... git grep -lIF -- "$v"   # real .env values in 0 tracked files
+git add -A                                         # 50 paths
+git commit -F - <<'EOF' ... EOF                    # fb937a7 "Phase 1: worker, control plane, scan-only queries, local[N]"
+gh repo create marun224/Distributed_Query_Engine --public --description "..." --source . --remote origin --push
+git remote -v; git branch -vv                      # main fb937a7 [origin/main]
+```
+
+## 2026-11-16 — Phase 1 confirmed by the owner; Phase 2 kickoff (read-only)
+
+```bash
+S=.venv/Lib/site-packages/icetl; grep -rnE "HUGEINT|hugeint" $S --include=*.py   # no global sum() cast in icetl: sum(INTEGER) stays HUGEINT
+grep -rnE "def (substitute_sources|_compile|compile_sql|render)" $S --include=*.py   # plan/builder.py:177, sql/session.py:812
+docker ps --format "{{.Names}} {{.Status}}"   # iceberg-nyc stack up; icefleet-dev not running
+```
+Tracker: Phase 1 confirmed; Phase 2 kickoff questions recorded (2.0).
+
+## 2026-11-16 — Phase 2 build (owner: "yes to all" on the six kickoff questions)
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\dev.ps1 up          # image rebuilt, container started
+
+# Spikes (scripts in the scratchpad, docker cp'd to /tmp, read-only)
+docker cp <scratchpad>\p2_spike.py icefleet-dev:/tmp/; .\scripts\dev.ps1 uv run python /tmp/p2_spike.py
+#   icetl's optimized trees for 13 aggregate shapes; COPY PARTITION_BY + RETURN_STATS works,
+#   FILE_SIZE_BYTES + PARTITION_BY "not implemented"; zero rows -> no files; 1.0/0 -> inf;
+#   hash(1::INTEGER) = hash(1::BIGINT) (later: NOT for -1); sum(INTEGER) -> HUGEINT
+docker cp <scratchpad>\p2_try.py icefleet-dev:/tmp/; .\scripts\dev.ps1 uv run python /tmp/p2_try.py
+#   14 aggregate queries on local[2] vs icetl: first run 2 BAD (raw path lost its WHERE;
+#   COUNT's big_int flag sent it to the raw path), fixed, then 14 OK
+
+# Building: format / lint / type / tests, iterated
+.\scripts\dev.ps1 uv run python -m ruff format py_src; ... ruff check py_src --output-format concise; ... mypy
+.\scripts\dev.ps1 uv run python -m ruff format .; ... ruff check . --output-format concise; ... mypy
+.\scripts\dev.ps1 uv run python -m pytest -q -x -p no:randomly py_test/unit py_test/test_seams.py
+#   HAVING "COUNT(*) > 50 AND ..." taken for an aggregate call (sqlglot's AND is a Func) -> fixed
+.\scripts\dev.ps1 uv run python -m pytest -q -p no:randomly py_test/unit py_test/test_seams.py
+#   10 failed: hash((-1)::INTEGER) != hash((-1)::BIGINT) -> keys cast to HUGEINT before hashing;
+#   ROLLUP is a node in GROUP BY; hive auto-detect invents __part on read; test fixes -> 190 passed
+.\scripts\dev.ps1 uv run python -m pytest -q -p no:randomly          # 319 passed, 1 failed (Phase 1 test used GROUP BY as "single-node")
+.\scripts\dev.ps1 uv run python -m pytest -q -p no:randomly py_test/cluster/test_behaviour.py   # 18 passed
+.\scripts\dev.ps1 uv run python scripts/smoke_cluster.py
+#   projection: 13/62 files, 4 splits, 6485 rows = icetl, prefix removed (5.6 s cold, 0.6 s warm, icetl 3.5 s)
+#   aggregate:  39/62 files, 4 splits, 64-way shuffle via MinIO, 4 final tasks, 4 rows = icetl, prefix removed
+#               (1.2 s, 1.0 s warm, icetl 0.6 s)
+.\scripts\dev.ps1 uv run tox                                          # lint/type/py312 (320 passed)/dist OK, 82.4 s -- Phase 2 gate green
+```
+
+Edits on Windows were made with the Edit/Write tools and small Python scripts (`python` = the
+Windows interpreter, text only). Two lessons: Windows Python defaults to cp1252, so a
+script must pass `encoding="utf-8"` (two files got `§`/`·` as single bytes and were
+repaired byte-wise); and the Bash tool collapses backslashes inside heredocs, so scripts
+with backslashes go through the Write tool.
+
+## 2026-11-16 — commit Phase 2 (owner: "pls commit phase 2"; not pushed)
+
+```bash
+git status --short; git check-ignore -q .env          # 30 paths; .env ignored
+grep -rIl -F "<string from a chat message>" .          # nothing (a credential-like string the owner sent; never written anywhere)
+grep -E "KEY|SECRET|PASSWORD|TOKEN" .env | ... git grep -lIF --untracked   # real .env values in 0 files
+git add -A
+git commit -F -                                        # "Phase 2: exchange (shuffle) and two-phase aggregation"
+```

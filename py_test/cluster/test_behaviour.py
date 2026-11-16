@@ -51,12 +51,31 @@ def test_explain_shows_the_stage_and_its_splits(
     assert "== Physical Plan (DuckDB SQL) ==" in out  # icetl's own explain follows, unchanged
 
 
+def _join(session: Any) -> Any:
+    return session.table("fx.plain").join(session.table("fx.plain").select("id"), "id")
+
+
 def test_explain_says_why_a_plan_runs_single_node(
     cluster: ClusterSession, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    cluster.table("fx.many").groupBy("flag").count().explain()
+    _join(cluster).explain()
     out = capsys.readouterr().out
-    assert "mode: single-node -- GROUP BY / aggregation -- Phase 2" in out
+    assert "mode: single-node -- a join -- Phase 3" in out
+
+
+def test_explain_shows_an_aggregate_as_two_stages(
+    cluster: ClusterSession, capsys: pytest.CaptureFixture[str]
+) -> None:
+    cluster.sql(
+        "SELECT flag, sum(qty) AS s FROM fx.many GROUP BY flag ORDER BY s DESC LIMIT 2"
+    ).explain()
+    lines = capsys.readouterr().out.splitlines()
+    text = "\n".join(lines)
+    assert any(line.startswith("stage 0  scan ") for line in lines), text
+    assert any(line.startswith("stage 1  final: ") for line in lines), text
+    assert '-> shuffle hash("flag") x 4' in text
+    assert 'partial: SUM("qty") · group by "flag"' in text
+    assert "coordinator  order by" in text and "limit 2" in text
 
 
 def test_a_plain_icetl_session_explains_exactly_as_before(
@@ -71,8 +90,8 @@ def test_a_plain_icetl_session_explains_exactly_as_before(
 
 def test_fallback_error_refuses_an_uncuttable_plan(fresh_cluster: ClusterSession) -> None:
     fresh_cluster.conf.set("icefleet.fallback", "error")
-    with pytest.raises(UnsupportedFeatureError, match="GROUP BY"):
-        fresh_cluster.table("fx.many").groupBy("flag").count().toArrow()
+    with pytest.raises(UnsupportedFeatureError, match="join"):
+        _join(fresh_cluster).toArrow()
     # A cuttable plan still runs.
     assert fresh_cluster.table("fx.plain").toArrow().num_rows == 5
 
@@ -110,6 +129,29 @@ def test_the_query_prefix_is_removed_afterwards(fresh_cluster: ClusterSession) -
     assert _leftovers(fresh_cluster) == []
 
 
+def test_an_aggregate_lays_out_the_exchange_as_planned(fresh_cluster: ClusterSession) -> None:
+    """PLAN §4.4: stage-0/task-<i>/__part=<p>/*.parquet, then stage-1/task-<p>/*.parquet."""
+    fresh_cluster.conf.set("icefleet.exchange.keep", "true")
+    fresh_cluster.conf.set("icefleet.shuffle.partitions", "4")
+    fresh_cluster.table("fx.many").groupBy("name").count().toArrow()
+    run = fresh_cluster._last_run
+    assert run is not None and run.query_id and run.stages == 2
+    root = _exchange_root(fresh_cluster) / run.query_id
+    shuffle = sorted(p.relative_to(root).as_posix() for p in (root / "stage-0").rglob("*.parquet"))
+    assert shuffle and all(
+        part.split("/")[1].startswith("task-") and part.split("/")[2].startswith("__part=")
+        for part in shuffle
+    ), shuffle
+    partitions = {part.split("/")[2].removeprefix("__part=") for part in shuffle}
+    finals = sorted(p.name for p in (root / "stage-1").iterdir())
+    assert finals == sorted(f"task-{p}" for p in partitions)
+    fresh_cluster.conf.set("icefleet.exchange.keep", "false")
+    fresh_cluster.table("fx.many").groupBy("name").count().toArrow()
+    last = fresh_cluster._last_run
+    assert last is not None and last.query_id
+    assert not (_exchange_root(fresh_cluster) / last.query_id).exists()
+
+
 def test_exchange_keep_leaves_the_stage_output(fresh_cluster: ClusterSession) -> None:
     fresh_cluster.conf.set("icefleet.exchange.keep", "true")
     fresh_cluster.table("fx.many").toArrow()
@@ -142,8 +184,9 @@ def test_a_dead_worker_fails_the_query_cleanly(fresh_cluster: ClusterSession) ->
     with pytest.raises(WorkerError, match="lost contact"):
         fresh_cluster.table("fx.many").toArrow()
     assert _leftovers(fresh_cluster) == []
-    # The session itself is still usable for what does not need the fleet.
-    assert fresh_cluster.table("fx.many").groupBy("flag").count().toArrow().num_rows == 3
+    # The session itself is still usable for what does not need the fleet (a join runs
+    # single-node until Phase 3).
+    assert _join(fresh_cluster).toArrow().num_rows == 5
 
 
 def test_a_task_error_names_the_worker_and_the_task(

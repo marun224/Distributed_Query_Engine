@@ -10,14 +10,21 @@ from icefleet import ClusterSession
 from icetl.sql import functions as F
 
 session = ClusterSession.builder.config("icefleet.master", "local[4]").getOrCreate()
-df = session.table("nyc.yellow_tripdata").filter(F.col("trip_distance") > 50)
-df.explain()  # == Distributed Plan ==: the stage, its splits, or why it runs single-node
+df = (
+    session.table("nyc.yellow_tripdata")
+    .groupBy("VendorID")
+    .agg(F.sum("total_amount").alias("revenue"))
+)
+df.explain()  # == Distributed Plan ==: partial sums -> shuffle by VendorID -> final sums
 df.toArrow()  # the same rows icetl returns on one machine
 ```
 
-**Status: Phase 1 built.** Scan-only queries (filters, projections, expressions, `LIMIT`)
-run on a fleet of DuckDB workers (`local[N]`, `static://`, `k8s://`); everything else runs
-single-node through icetl and `explain()` says why. Aggregation is Phase 2. The design is in
+**Status: Phase 2 built.** Filters, projections and aggregation (`GROUP BY`, global
+aggregates, `HAVING`, `DISTINCT`) run on a fleet of DuckDB workers (`local[N]`,
+`static://`, `k8s://`): partial aggregates on the splits, a hash shuffle through the object
+store, final aggregates per partition. `ORDER BY` / `LIMIT` on top are applied by the
+coordinator. Joins (Phase 3), windows and set operations (Phase 4) run single-node through
+icetl, and `explain()` says why. The design is in
 [docs/PLAN_distributed_engine.md](docs/PLAN_distributed_engine.md); what is done is in
 [docs/task_tracker.md](docs/task_tracker.md); how work runs is in
 [docs/workflow_instructions_file.md](docs/workflow_instructions_file.md).

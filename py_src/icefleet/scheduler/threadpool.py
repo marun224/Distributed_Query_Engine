@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from icefleet.cluster.client import Cluster, WorkerClient
     from icefleet.exchange.base import Exchange
-    from icefleet.plan.stages import ScanStage, StagePlan
+    from icefleet.plan.stages import StagePlan
     from icefleet.plan.tasks import TaskResult, TaskSpec
 
 __all__ = ["ThreadPoolScheduler"]
@@ -35,15 +35,17 @@ class ThreadPoolScheduler:
         return f"thread pool over {self._cluster.summary()}"
 
     def run(self, plan: StagePlan, *, query_id: str, exchange: Exchange) -> list[TaskResult]:
+        """Every stage in order, each fully before the next (a blocking shuffle): a stage's
+        tasks are built from the manifests of the stages before it, never from a glob."""
         results: list[TaskResult] = []
         for stage in plan.stages:
-            results = self._run_stage(stage, query_id=query_id, exchange=exchange)
+            specs = stage.tasks(
+                query_id, exchange, results, target_file_bytes=self._target_file_bytes
+            )
+            results.extend(self._run_tasks(specs, query_id=query_id))
         return results
 
-    def _run_stage(
-        self, stage: ScanStage, *, query_id: str, exchange: Exchange
-    ) -> list[TaskResult]:
-        specs = stage.tasks(query_id, exchange, target_file_bytes=self._target_file_bytes)
+    def _run_tasks(self, specs: list[TaskSpec], *, query_id: str) -> list[TaskResult]:
         if not specs:
             return []
         slots: queue.Queue[WorkerClient] = queue.Queue()

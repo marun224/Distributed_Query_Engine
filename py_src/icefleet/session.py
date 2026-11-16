@@ -5,9 +5,10 @@ the catalog. Only execution changes (PLAN §3.2):
 
     icetl compiles the plan unchanged (conformance, binding, optimizer, pushdown, scans)
     -> plan_stages() cuts it, or says why it cannot (Uncuttable)
-    -> cuttable:   the scheduler runs the stages on the workers; the coordinator's own
-                   DuckDB reads the final stage's files; the query's exchange prefix is
-                   deleted
+    -> cuttable:   the scheduler runs the stages on the workers, each fully before the
+                   next; the coordinator's own DuckDB reads the final stage's files,
+                   casting stand-in types back and applying ORDER BY / LIMIT; the query's
+                   exchange prefix is deleted
     -> uncuttable: icetl runs it single-node, on this process (P3), unless
                    icefleet.fallback=error
 
@@ -23,7 +24,7 @@ import shutil
 import tempfile
 import threading
 import uuid
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
@@ -41,6 +42,7 @@ from icefleet.errors import ClusterConfigurationError, ClusterError, Uncuttable
 from icefleet.exchange import Exchange, open_exchange
 from icefleet.plan.describe import describe_plan
 from icefleet.plan.stages import StagePlan, plan_stages
+from icefleet.plan.types import cast_to
 from icefleet.scheduler import ThreadPoolScheduler
 
 if TYPE_CHECKING:
@@ -66,8 +68,10 @@ class QueryRun:
     mode: str  # "distributed" | "single-node" | "metadata"
     reason: str | None = None
     query_id: str | None = None
-    tasks: int = 0
-    files: int = 0
+    stages: int = 0
+    tasks: int = 0  # across every stage
+    stage_tasks: tuple[int, ...] = ()  # per stage, in order
+    files: int = 0  # the final stage's result files
     rows: int = 0
 
 
@@ -112,6 +116,7 @@ class ClusterSession(Session):
         self._exchange: Exchange | None = None
         self._owned_exchange_dir: str | None = None
         self._last_run: QueryRun | None = None
+        self._aggregate_names: frozenset[str] | None = None
 
     def __repr__(self) -> str:
         name = self._conf.get("icetl.appName", "icetl")
@@ -169,14 +174,30 @@ class ClusterSession(Session):
 
     # -- planning ----------------------------------------------------------
 
-    def _output_types(self, plan: exp.Expression, sources: Mapping[str, ScanSource]) -> list[str]:
-        """The DuckDB type of every output column, from icetl's offline analyzer."""
-        self._analyze(plan, sources)  # registers the zero-row views; raises like icetl would
-        bound = substitute_sources(
-            plan, sources, lambda source: exp.to_identifier(source.view, quoted=True)
-        )
-        sql = f"DESCRIBE SELECT * FROM ({bound.sql(dialect='duckdb')}) AS icefleet_analysis"
-        return [str(row[1]) for row in self._analyzer.connection.execute(sql).fetchall()]
+    def _describer(
+        self, sources: Mapping[str, ScanSource]
+    ) -> Callable[[exp.Expression], list[tuple[str, str]]]:
+        """Types any SELECT over `sources` with DuckDB, against icetl's zero-row views."""
+
+        def describe(tree: exp.Expression) -> list[tuple[str, str]]:
+            bound = substitute_sources(
+                tree, sources, lambda source: exp.to_identifier(source.view, quoted=True)
+            )
+            sql = f"DESCRIBE SELECT * FROM ({bound.sql(dialect='duckdb')}) AS icefleet_analysis"
+            rows = self._analyzer.connection.execute(sql).fetchall()
+            return [(str(row[0]), str(row[1])) for row in rows]
+
+        return describe
+
+    def _duckdb_aggregates(self) -> frozenset[str]:
+        """Every aggregate function name DuckDB knows, so none is taken for row-wise work."""
+        if self._aggregate_names is None:
+            rows = self._analyzer.connection.execute(
+                "SELECT DISTINCT lower(function_name) FROM duckdb_functions() "
+                "WHERE function_type = 'aggregate'"
+            ).fetchall()
+            self._aggregate_names = frozenset(str(row[0]) for row in rows)
+        return self._aggregate_names
 
     def _stage_plan(
         self,
@@ -187,14 +208,17 @@ class ClusterSession(Session):
         compiled = self._compile(plan, sources, output_names)
         _, slots = self._cluster_shape()
         udfs = list(self._udf.registered) if self._udf is not None else []
+        self._analyze(plan, sources)  # registers the zero-row views; raises like icetl would
         return plan_stages(
             compiled,
             sources,
             output_names=list(output_names),
-            output_types=self._output_types(plan, sources),
             fleet=self._fleet(),
             min_splits=slots,
+            describe=self._describer(sources),
+            register=self._engine.register,
             udf_names=udfs,
+            aggregate_names=self._duckdb_aggregates(),
         )
 
     def _describe_distributed(
@@ -246,7 +270,7 @@ class ClusterSession(Session):
             self._single_node(staged)
             return super()._execute(plan, sources, output_names)
         with self._distributed(staged) as files:
-            sql, parameters = self._result_query(files, staged.limit)
+            sql, parameters = self._result_query(files, staged)
             return self._engine.arrow(sql, parameters)
 
     def _stream(
@@ -270,7 +294,7 @@ class ClusterSession(Session):
             yield from super()._stream(plan, sources, output_names, batch_size=batch_size)
             return
         with self._distributed(staged) as files:
-            sql, parameters = self._result_query(files, staged.limit)
+            sql, parameters = self._result_query(files, staged)
             yield from self._engine.record_batches(sql, parameters, batch_size=batch_size)
 
     @contextmanager
@@ -283,7 +307,8 @@ class ClusterSession(Session):
         scheduler = ThreadPoolScheduler(cluster, target_file_bytes=fleet.result_file_bytes)
         try:
             results = scheduler.run(staged, query_id=query_id, exchange=exchange)
-            files = [f for result in results for f in result.manifest]
+            final = staged.final.stage_id
+            files = [f for r in results if r.stage_id == final for f in r.manifest]
             if not files:
                 raise ClusterError(f"query {query_id}: the final stage reported no output files")
             size = sum(f.bytes for f in files)
@@ -296,7 +321,12 @@ class ClusterSession(Session):
             self._last_run = QueryRun(
                 mode="distributed",
                 query_id=query_id,
+                stages=len(staged.stages),
                 tasks=len(results),
+                stage_tasks=tuple(
+                    sum(1 for r in results if r.stage_id == stage.stage_id)
+                    for stage in staged.stages
+                ),
                 files=len(files),
                 rows=sum(f.rows for f in files),
             )
@@ -309,18 +339,34 @@ class ClusterSession(Session):
                     logger.warning("could not remove the exchange prefix of %s: %s", query_id, exc)
 
     def _result_query(
-        self, files: Sequence[OutputFile], limit: int | None
+        self, files: Sequence[OutputFile], staged: StagePlan
     ) -> tuple[str, dict[str, Any]]:
-        """The coordinator's read of the final stage: exactly the manifest's files, in task
-        order (DuckDB preserves it), with the LIMIT re-applied over the concatenation."""
+        """The coordinator's read of the final stage: exactly the manifest's files.
+
+        Stand-in columns are cast back to their own type, hidden order columns dropped,
+        and the ORDER BY / LIMIT lifted off the plan applied over the concatenation
+        (kickoff answer 2). Without an ORDER BY, task order is kept (DuckDB preserves it).
+        """
         paths = [f.path for f in files]
         self._engine.ensure_object_store(paths)
+        columns: list[exp.Expression] = []
+        for name in staged.columns:
+            column = exp.column(name, quoted=True)
+            kind = staged.restore.get(name)
+            columns.append(
+                exp.Alias(this=cast_to(column, kind), alias=exp.to_identifier(name, quoted=True))
+                if kind
+                else column
+            )
+        listing = ", ".join(c.sql(dialect="duckdb") for c in columns)
         sql = (
-            f"SELECT * FROM read_parquet(${_RESULT_PARAMETER}, "
+            f"SELECT {listing} FROM read_parquet(${_RESULT_PARAMETER}, "
             f"union_by_name => false, hive_partitioning => false)"
         )
-        if limit is not None:
-            sql += f" LIMIT {int(limit)}"
+        if staged.order:
+            sql += " ORDER BY " + ", ".join(staged.order)
+        if staged.limit is not None:
+            sql += f" LIMIT {int(staged.limit)}"
         return sql, {_RESULT_PARAMETER: paths}
 
     # -- lifecycle ---------------------------------------------------------

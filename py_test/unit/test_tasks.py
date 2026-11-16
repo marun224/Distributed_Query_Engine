@@ -47,13 +47,35 @@ def test_task_result_round_trips_and_sums() -> None:
     assert TaskResult.from_json(payload) == result
 
 
+def test_a_shuffle_sink_and_partitioned_files_round_trip() -> None:
+    sink = SinkSpec(kind="shuffle", location="/x/q-1/stage-0/task-3", partitions=64)
+    assert SinkSpec.from_json(json.loads(json.dumps(sink.to_json()))) == sink
+    assert SinkSpec.from_json({"kind": "result", "location": "/x"}).partitions == 1
+    result = TaskResult(
+        query_id="q-1",
+        stage_id=0,
+        task_index=3,
+        attempt=0,
+        worker="w:1",
+        seconds=0.5,
+        manifest=(OutputFile("/a/__part=7/data_0.parquet", 10, 2, partition=7),),
+    )
+    payload = json.loads(json.dumps(result.to_json()))
+    assert payload["manifest"][0]["partition"] == 7
+    assert TaskResult.from_json(payload) == result
+    # A result file carries no partition at all.
+    assert "partition" not in OutputFile("/a", 1, 1).to_json()
+    with pytest.raises(ValueError):
+        OutputFile.from_json({"path": "/a", "bytes": 1, "rows": 1, "partition": "7"})
+
+
 @pytest.mark.parametrize(
     "change",
     [
         {"stage_id": "0"},
         {"sql": None},
         {"inputs": []},
-        {"sink": {"kind": "shuffle", "location": "/x"}},
+        {"sink": {"kind": "iceberg_files", "location": "/x"}},
         {"task_index": True},
     ],
 )

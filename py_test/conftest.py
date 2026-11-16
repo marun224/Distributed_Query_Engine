@@ -68,6 +68,9 @@ def cluster_conf(workers: int, exchange: Path, **extra: str) -> IcetlConf:
             "icefleet.exchange.location": str(exchange),
             "icefleet.worker.slots": "2",
             "icefleet.local.threads": "2",
+            # Few partitions keep the offline suite fast (kickoff answer 3); empty ones
+            # get no task anyway.
+            "icefleet.shuffle.partitions": "4",
             "icefleet.fallback": "single-node",
             **extra,
         }

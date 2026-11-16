@@ -132,3 +132,81 @@ def test_a_cancelled_query_runs_no_more_tasks(
 def test_run_task_is_phase_6b(capsys: pytest.CaptureFixture[str]) -> None:
     assert main(["run-task", "s3://bucket/spec.json"]) == EXIT_NOT_IMPLEMENTED
     assert "Phase 6b" in capsys.readouterr().err
+
+
+def test_a_shuffle_task_writes_one_directory_per_partition(
+    worker: WorkerServer, data_file: str, tmp_path: Path
+) -> None:
+    sql = "SELECT id, name, hash(id) % 4 AS __part FROM read_parquet($p)"
+    spec = TaskSpec(
+        query_id="q-s",
+        stage_id=0,
+        task_index=0,
+        sql=sql,
+        inputs={"p": InputSpec(paths=(data_file,))},
+        sink=SinkSpec(
+            kind="shuffle", location=(tmp_path / "out" / "task-0").as_posix(), partitions=4
+        ),
+    )
+    status, body = call(worker, "POST", "/tasks", spec.to_json())
+    assert status == 200, body
+    result = TaskResult.from_json(body)
+    assert sum(f.rows for f in result.manifest) == 100
+    assert {f.partition for f in result.manifest} <= {0, 1, 2, 3}
+    for output in result.manifest:
+        assert f"__part={output.partition}/" in output.path.replace("\\", "/")
+        # The partition column is not written into the file. (Read without hive
+        # partitioning, as the final stage does: DuckDB would infer it from the path.)
+        read = f"read_parquet('{output.path}', hive_partitioning => false)"
+        columns = [
+            c[0] for c in duckdb.connect().execute(f"DESCRIBE SELECT * FROM {read}").fetchall()
+        ]
+        assert columns == ["id", "name"]
+        where = f"hash(id) % 4 = {output.partition}"
+        expected = (
+            duckdb.connect()
+            .execute(f"SELECT count(*) FROM read_parquet('{data_file}') WHERE {where}")
+            .fetchone()
+        )
+        assert expected is not None and output.rows == expected[0]
+
+
+def test_a_shuffle_task_with_no_rows_reports_no_files(
+    worker: WorkerServer, data_file: str, tmp_path: Path
+) -> None:
+    for partitions in (1, 4):
+        sql = "SELECT id, hash(id) % 4 AS __part FROM read_parquet($p) WHERE id < 0"
+        if partitions == 1:
+            sql = "SELECT id FROM read_parquet($p) WHERE id < 0"
+        spec = TaskSpec(
+            query_id="q-e",
+            stage_id=0,
+            task_index=partitions,
+            sql=sql,
+            inputs={"p": InputSpec(paths=(data_file,))},
+            sink=SinkSpec(
+                kind="shuffle",
+                location=(tmp_path / f"task-{partitions}").as_posix(),
+                partitions=partitions,
+            ),
+        )
+        status, body = call(worker, "POST", "/tasks", spec.to_json())
+        assert status == 200, body
+        assert TaskResult.from_json(body).manifest == ()
+
+
+def test_a_single_partition_shuffle_is_partition_zero(
+    worker: WorkerServer, data_file: str, tmp_path: Path
+) -> None:
+    spec = TaskSpec(
+        query_id="q-1p",
+        stage_id=0,
+        task_index=0,
+        sql="SELECT count(*) AS n FROM read_parquet($p)",
+        inputs={"p": InputSpec(paths=(data_file,))},
+        sink=SinkSpec(kind="shuffle", location=(tmp_path / "one").as_posix(), partitions=1),
+    )
+    status, body = call(worker, "POST", "/tasks", spec.to_json())
+    assert status == 200, body
+    manifest = TaskResult.from_json(body).manifest
+    assert len(manifest) == 1 and manifest[0].partition == 0 and manifest[0].rows == 1

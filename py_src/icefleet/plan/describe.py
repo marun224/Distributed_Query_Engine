@@ -34,21 +34,28 @@ def describe_plan(
     elif isinstance(staged, Uncuttable):
         lines.append(f"mode: single-node -- {staged.reason}")
     else:
+        from icefleet.plan.stages import ScanStage
+
         lines.append(f"mode: distributed · {cluster}")
         for stage in staged.stages:
-            scan = stage.scan
-            lines.append(
-                f"stage {stage.stage_id}  scan {stage.table}  {len(stage.splits)} splits · "
-                f"{scan.describe()}"
-            )
-            sizes = [split.bytes for split in stage.splits]
-            if sizes:
+            indent = " " * 9
+            notes = list(stage.notes)
+            if isinstance(stage, ScanStage):
                 lines.append(
-                    f"         split sizes {format_bytes(min(sizes))} .. {format_bytes(max(sizes))}"
+                    f"stage {stage.stage_id}  scan {stage.table}  {len(stage.splits)} splits · "
+                    f"{stage.scan.describe()}"
                 )
-            limit = (
-                f" · limit {stage.limit} per task and overall" if stage.limit is not None else ""
-            )
-            lines.append(f"         -> result{limit}")
+                sizes = [split.bytes for split in stage.splits]
+                if sizes:
+                    lines.append(
+                        f"{indent}split sizes {format_bytes(min(sizes))} .. "
+                        f"{format_bytes(max(sizes))}"
+                    )
+            else:
+                lines.append(f"stage {stage.stage_id}  {notes.pop(0) if notes else 'reads stage'}")
+            lines.extend(f"{indent}{note}" for note in notes)
+        note = staged.coordinator_note()
+        if note:
+            lines.append(f"coordinator  {note}")
         lines.append(f"exchange {exchange}")
     return "\n".join(lines) + "\n\n"

@@ -1,5 +1,7 @@
 """The oracle suite: every query on `local[2]` and `local[3]` equals icetl's answer.
 
+Scans, filters and projections here; aggregation has its own suite (`test_aggregates.py`).
+
 Each case also asserts *how* it ran. A plan that quietly stopped distributing would still
 return the right rows, so the mode is part of what is tested.
 """
@@ -15,7 +17,7 @@ from icetl.sql import DataFrame, Session
 from icetl.sql import functions as F
 
 from icefleet.session import ClusterSession
-from py_test.oracle import assert_same_rows, sorted_rows
+from py_test.oracle import assert_same_ordered_rows, assert_same_rows, sorted_rows
 
 Query = Callable[[Session], DataFrame]
 
@@ -51,16 +53,35 @@ DISTRIBUTED: dict[str, Query] = {
     "limit above the row count": lambda s: (
         s.table("fx.many").filter(F.col("qty") > 40).limit(100_000)
     ),
+    "group by": lambda s: s.table("fx.many").groupBy("flag").agg(F.sum("qty")),
+    "distinct": lambda s: s.table("fx.many").select("flag").distinct(),
+}
+
+#: The order is the answer: compared row by row, in order. Every key is unique.
+ORDERED: dict[str, Query] = {
+    "order by": lambda s: s.table("fx.many").orderBy("id"),
+    "order by descending, nulls": lambda s: s.table("fx.many").orderBy(F.col("id").desc()),
+    "order by a column not selected, with a limit": lambda s: s.sql(
+        "SELECT name, qty FROM fx.many WHERE qty IS NOT NULL ORDER BY id DESC LIMIT 7"
+    ),
+    "top n": lambda s: (
+        s.table("fx.many")
+        .filter(F.col("amount").isNotNull())
+        .orderBy(F.col("amount").desc(), "id")
+        .limit(10)
+    ),
 }
 
 SINGLE_NODE: dict[str, tuple[Query, str]] = {
-    "group by": (lambda s: s.table("fx.many").groupBy("flag").agg(F.sum("qty")), "Phase 2"),
-    "order by": (lambda s: s.table("fx.many").orderBy("id"), "Phase 4"),
+    "window": (
+        lambda s: s.sql("SELECT id, row_number() OVER (ORDER BY id) AS r FROM fx.many"),
+        "Phase 4",
+    ),
+    "offset": (lambda s: s.sql("SELECT id FROM fx.many ORDER BY id LIMIT 5 OFFSET 3"), "Phase 4"),
     "join": (
         lambda s: s.table("fx.plain").join(s.table("fx.plain").select("id"), "id"),
         "Phase 3",
     ),
-    "distinct": (lambda s: s.table("fx.many").select("flag").distinct(), "Phase 2"),
     "renamed columns": (lambda s: s.table("fx.renamed"), "Phase 7"),
     "no data files": (lambda s: s.table("fx.empty"), "no data files"),
     # Iceberg's column statistics prune every file before anything is distributed.
@@ -95,10 +116,22 @@ def test_uncuttable_runs_single_node_and_equals_icetl(
     assert run is not None and run.mode == "single-node", run
     assert reason in (run.reason or "")
     expected = query(oracle).toArrow()
-    if name == "order by":
-        assert actual.equals(expected)  # the order itself is the answer
+    if name == "offset":
+        assert_same_ordered_rows(actual, expected)
     else:
         assert_same_rows(actual, expected)
+
+
+@pytest.mark.parametrize("name", list(ORDERED))
+def test_ordered_results_equal_icetl_in_order(
+    name: str, cluster: ClusterSession, oracle: Session
+) -> None:
+    """ORDER BY / LIMIT are applied by the coordinator over the result (kickoff answer 2)."""
+    query = ORDERED[name]
+    actual = query(cluster).toArrow()
+    run = cluster._last_run
+    assert run is not None and run.mode == "distributed", run
+    assert_same_ordered_rows(actual, query(oracle).toArrow())
 
 
 def test_limit_returns_that_many_rows_of_the_answer(

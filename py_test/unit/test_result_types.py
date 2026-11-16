@@ -1,7 +1,7 @@
 """Pins the claim behind `parquet_unsafe_type`: which DuckDB types survive a result file.
 
 Measured, not assumed (P6). If a DuckDB upgrade changes how a type round-trips through
-parquet, this fails and the list in `icefleet.plan.stages` must be revisited -- in either
+parquet, this fails and the list in `icefleet.plan.types` must be revisited -- in either
 direction: a type that starts surviving can be distributed, one that stops must not be.
 """
 
@@ -13,6 +13,7 @@ import duckdb
 import pytest
 
 from icefleet.plan.stages import parquet_unsafe_type
+from icefleet.plan.types import parquet_safe_type
 
 VALUES = {
     "BOOLEAN": "true",
@@ -69,3 +70,41 @@ def test_guard_matches_what_parquet_actually_does(duckdb_type: str, tmp_path: Pa
     assert parquet_unsafe_type(described) == (not survives), (
         f"{duckdb_type} (DESCRIBE says {described}): arrow {before} -> {after}"
     )
+
+
+STAND_INS = {
+    "HUGEINT": "DECIMAL(38,0)",
+    "UHUGEINT": "DECIMAL(38,0)",
+    "TIMESTAMP_S": "TIMESTAMP",
+    "TIMESTAMP_MS": "TIMESTAMP",
+    "INTEGER[2]": "INTEGER[]",
+    "ENUM('x', 'y')": None,
+    "BIT": None,
+    "VARINT": None,
+    "UNION(i INTEGER, s VARCHAR)": None,
+}
+
+
+@pytest.mark.parametrize("duckdb_type", list(STAND_INS))
+def test_stand_ins_bring_the_value_and_its_type_back(duckdb_type: str, tmp_path: Path) -> None:
+    """Phase 2 (kickoff answer 5): an unsafe type with a stand-in crosses parquet as the
+    stand-in and is cast back; the round trip returns the same Arrow type and value."""
+    con = duckdb.connect()
+    query = f"SELECT ({VALUES[duckdb_type]})::{duckdb_type} AS c"
+    described = con.execute(f"DESCRIBE {query}").fetchall()[0][1]
+    stand_in = parquet_safe_type(described)
+    assert stand_in == STAND_INS[duckdb_type]
+    if stand_in is None:
+        return
+    assert not parquet_unsafe_type(stand_in)
+    path = (tmp_path / "t.parquet").as_posix()
+    con.execute(f"COPY (SELECT c::{stand_in} AS c FROM ({query})) TO '{path}' (FORMAT parquet)")
+    back = con.execute(f"SELECT c::{described} AS c FROM read_parquet('{path}')").to_arrow_table()
+    original = con.execute(query).to_arrow_table()
+    assert back.schema.equals(original.schema)
+    assert back.to_pylist() == original.to_pylist()
+
+
+def test_a_safe_type_is_its_own_stand_in() -> None:
+    for duckdb_type in ("BIGINT", "DECIMAL(10,2)", "TIMESTAMP WITH TIME ZONE", "VARCHAR[]"):
+        assert parquet_safe_type(duckdb_type) == duckdb_type

@@ -1,6 +1,6 @@
 # icefleet — a distributed SQL and DataFrame engine over Apache Iceberg, executed by a fleet of DuckDB workers
 
-**Status:** Draft v1.3 — 2026-11-15, decisions locked (§2); v1.1 adds decision 26 (HTTP control plane) and decision 27 (Kubernetes + Argo Workflows as the deployment target); v1.2 adds decision 28 (development in a Linux dev container); v1.3 records Phase 1 as built (§6), corrects §4.6 (DuckDB writes field ids) and extends the seam table (§4.10)
+**Status:** Draft v1.4 — 2026-11-16, decisions locked (§2); v1.1 adds decision 26 (HTTP control plane) and decision 27 (Kubernetes + Argo Workflows as the deployment target); v1.2 adds decision 28 (development in a Linux dev container); v1.3 records Phase 1 as built (§6), corrects §4.6 (DuckDB writes field ids) and extends the seam table (§4.10); v1.4 records Phase 2 as built (§6), corrects §4.1 (DuckDB hashes integers by width) and §4.4 (shuffle files are not rolled), extends §4.10 and §5
 **Owner:** Arun
 **Base:** [`icetl`](https://github.com/marun224/data_transformation_engine) 0.1.0 — single-node, sqlglot IR, PyIceberg planning, DuckDB execution. Local checkout: `E:\workspace\Transformation_Engine_08172026`.
 **State of the work:** [task_tracker.md](task_tracker.md). This file is the design; it does not say what is done.
@@ -304,6 +304,14 @@ common type on both sides before hashing (an `INTEGER` and a `BIGINT` holding `1
 guaranteed to hash alike), and every worker must run the same DuckDB version (the `ping`
 handshake refuses a mismatch) because `hash()` stability across versions is not promised.
 
+> **Correction, 2026-11-16 (Phase 2, measured on DuckDB 1.5.6):** the cast is not optional
+> even for integers. `hash(1::INTEGER) = hash(1::BIGINT)`, but `hash((-1)::INTEGER) ≠
+> hash((-1)::BIGINT)`. `partition_expression` therefore hashes every integer type except
+> `UHUGEINT` as `HUGEINT`, and `FLOAT` as `DOUBLE`, whatever the query compares;
+> `py_test/unit/test_partitioning.py` pins both the fact and the fix. Within one aggregate
+> every key has a single type, so Phase 2 needs it only for consistency; Phase 3's joins
+> need it for correctness. `DECIMAL` keys of different scales are still Phase 3's to align.
+
 ### 4.2 Two-phase aggregation
 
 `Aggregate(keys, aggs)` over a scan is cut into **partial** (on the splits) → `Hash(keys)` →
@@ -349,6 +357,18 @@ No cost-based join reordering (decision 6). sqlglot's `optimize_joins` already r
 - **Why not a glob:** a glob reads what is there, including a failed attempt's leftovers. A manifest reads what completed. P5.
 - **Clean-up:** the query prefix is removed by the coordinator (`s3fs` / `shutil`) in a `finally`; a crashed coordinator leaves garbage, and `icefleet-admin gc <location> --older-than 1d` (Phase 7) removes it.
 - **Single-machine `local[N]`:** `LocalDirExchange` is the same code with a directory; it is what the offline suite exercises, so the object-store implementation adds only the path scheme and the listing/deletion client.
+
+> **As built, Phase 2 (2026-11-16):** `RETURN_STATS` (not `RETURN_FILES`) gives the
+> manifest, and the partition is read off each file's `__part=<p>/` directory.
+> `FILE_SIZE_BYTES` cannot be combined with `PARTITION_BY` in DuckDB 1.5.6, so shuffle
+> files are not rolled (one file per task and partition). The partition column is not
+> written into the files; reading one with DuckDB's default hive auto-detection would
+> invent it from the path, which is why every read says `hive_partitioning => false`.
+> A task with no rows writes nothing and reports no files. A final-stage partition no
+> row reached gets **no task**; when no partition has rows at all, partition 0 runs over
+> a typed empty relation (`SELECT CAST(NULL AS t) AS c, ... WHERE FALSE`) rendered into
+> its SQL, so the result keeps its schema and a global aggregate its one row. The
+> reserved `InputSpec.schema_ipc` is not needed for that.
 
 ### 4.5 Splits
 
@@ -417,6 +437,8 @@ Overridden (private, which is why the pin is exact):
 | `Session.Builder.getOrCreate` / `create`, `Session._active` *(Phase 1)* | `ClusterSession.Builder` subclasses them so the builder makes a `ClusterSession` (icetl's hard-codes `Session(...)`) | `Session._builder_class` or `cls(...)` in the builder |
 | `Session._analyzer.connection`, `Session._udf`, `Session._engine` *(Phase 1, read only)* | `DESCRIBE` of the output types (the parquet-safety check, §4.4); UDF names (a UDF call is uncuttable); the coordinator's DuckDB reads the result | part of the `Executor` context |
 | per-file sizes inside `plan_scan` *(Phase 1)* | not reachable, so `plan/splits.py` lists the scan's files again from the manifests (one extra metadata pass on the coordinator) | `ScanPlan` keeps per-file sizes |
+| `exec.source_sql.build_source`, `DuckDBEngine.register` *(Phase 2)* | stage SQL is no longer icetl's compiled SQL: each stage's own tree is rendered through `substitute_sources` + `build_source` with `CompiledPlan.scans`, exactly as `_compile` renders the whole query | `CompiledPlan` exposes a `render(tree)` |
+| `Session._analyzer.connection` *(Phase 2, wider use)* | `DESCRIBE` types every stage (keys, partials, each aggregate as it is single-node); `duckdb_functions()` lists DuckDB's aggregates, because sqlglot leaves some (`list`) as scalar functions | part of the `Executor` context |
 
 Each upstream hook is a small, additive PR to the icetl repo and a version bump of the pin. Until then: `icetl==0.1.0`, and `py_test/test_seams.py` asserts every private attribute icefleet touches still exists with the expected signature, so a pin bump fails loudly rather than mysteriously.
 
@@ -432,10 +454,12 @@ py_src/icefleet/
   errors.py              Uncuttable, ClusterError, WorkerError
   _versions.py           the handshake's versions and protocol number
   plan/
-    rel.py               RelNode types; from_sqlglot / to_sqlglot
-    partitioning.py      Hash / Single / Broadcast / Range, requirement rules
-    stages.py            StagePlan, plan_stages()
-    aggregates.py        decomposition table (§4.2)
+    rel.py               RelNode types (Scan, Project, Aggregate) and Query; from_sqlglot
+    partitioning.py      Hash / Single / Broadcast / Range, requirement rules (Phase 3+;
+                         Phase 2's hash partitioner lives in aggregates.py)
+    stages.py            StagePlan, ScanStage, ShuffleStage, plan_stages()
+    aggregates.py        decomposition table (§4.2), the partial/final rewrite, partition_expression
+    types.py             parquet-unsafe types and their lossless stand-ins (Phase 2)
     joins.py             strategy choice (§4.3)
     splits.py            bin-packing (§4.5)
     tasks.py             TaskSpec / TaskResult (de)serialisation
@@ -546,6 +570,49 @@ a feeling.
 - Tests: every aggregate in the table against the oracle, grouped and global, with and without `HAVING`; `count(distinct)` raw path; empty groups; NULL keys; a property test (hypothesis) that the partitioner sends every row to exactly one partition and equal keys to the same one.
 
 **Done when:** the aggregation suite passes on `local[3]`; the headline query runs two-stage on `nyc.yellow_tripdata` and matches icetl; the partition prefix layout matches §4.4; tracker updated.
+
+**As built (2026-11-16).** Where the build differs from the list above or adds to it:
+
+- **Kickoff answers (owner, "yes to all"):** (1) a GROUP BY / global aggregate / DISTINCT
+  over one table, with WHERE, HAVING and expressions over aggregates; (2) `ORDER BY` /
+  `LIMIT` on top applied by the coordinator, for aggregates and Phase 1 scans alike;
+  (3) `icefleet.shuffle.partitions` default 64, no task for a partition without rows,
+  tests at 4; (4) stage SQL built from the optimized tree's own nodes, rendered through
+  icetl's `build_source` (a new seam, §4.10); (5) parquet-unsafe partials and results
+  carried as lossless stand-ins and cast back, every final aggregate cast to its
+  single-node type; (6) proof of life by extending `scripts/smoke_cluster.py`.
+- **Recognised shape:** a *chain* of single-table SELECTs, `Project* → Aggregate? →
+  Project* → Scan` (`plan/rel.py`). That is how icetl's optimizer leaves a flat aggregate,
+  a `.filter()` after `.agg()` (a Project over an aggregate subquery) and a
+  `.withColumn()` before `.groupBy()` (an aggregate over a Project subquery).
+- **ORDER BY / LIMIT** are lifted off the top SELECT. A key that is not a result column
+  becomes a hidden result column the coordinator orders by and drops; with a LIMIT, each
+  final task keeps its own top-n first. ORDER BY / LIMIT inside a subquery, OFFSET, and
+  ORDER BY outside a `SELECT DISTINCT` stay single-node (Phase 4).
+- **Aggregates are found by DuckDB's catalog too.** sqlglot parses `list(x)` from icetl's
+  trees as a scalar `exp.List`; Phase 1 would have distributed `SELECT list(x) FROM t` as
+  row-at-a-time work and returned one list per split. Fixed: a call is an aggregate when
+  it is a sqlglot `AggFunc` *or* its name is in `duckdb_functions()`'s aggregates.
+- **Partial path** for `count`, `sum`, `avg` (as `sum` + `count`, only when the
+  single-node type is `DOUBLE`), `min`, `max`, `bool_and/or`, `bit_and/or/xor`; anything
+  else -- a `DISTINCT` or `FILTER` aggregate, `list`, `string_agg`, `median`, ... -- takes
+  the **raw path** (§4.2), and `explain()` names the aggregate that forced it. Every
+  final aggregate is `CAST(<combinator> AS <its single-node type>)`, found with one
+  `DESCRIBE` of a probe SELECT; `avg` divides by `NULLIF(count, 0)` because DuckDB's
+  `x / 0` is `inf`, not NULL.
+- **Stand-ins** (`plan/types.py`): `HUGEINT`/`UHUGEINT` → `DECIMAL(38,0)`,
+  `TIMESTAMP_S/_MS` → `TIMESTAMP`, `T[n]` → `T[]`. A Phase 1 result of one of these types
+  now distributes too. ENUM, BIT, VARINT, UNION still run single-node.
+- **Key alignment** (§4.1 correction): integer keys hashed as `HUGEINT`, `FLOAT` as
+  `DOUBLE`. Grouping sets / ROLLUP / CUBE are Phase 4.
+- **Explain** prints each stage's work (`partial: ... · group by ...` or `raw rows, no
+  partial aggregate (<why>)`), the shuffle (`-> shuffle hash(k) x n`), the final, and a
+  `coordinator` line for ORDER BY / LIMIT.
+- **Proof of life:** `smoke_cluster.py` on `nyc.yellow_tripdata`: revenue, trips and mean
+  distance per VendorID over 39 of 62 files (2024 onwards), 4 splits on `local[2]`, a
+  64-way shuffle through MinIO of which 4 partitions had rows, 4 rows equal to icetl
+  (doubles to 1e-9), prefix removed. 1.2 s cold, 1.0 s warm, icetl 0.6 s (one run each,
+  not a benchmark). `docs/divergence.md` records the floating-point tolerance.
 
 ### Phase 3 — Joins
 

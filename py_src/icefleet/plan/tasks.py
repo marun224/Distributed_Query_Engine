@@ -1,7 +1,7 @@
 """`TaskSpec` and `TaskResult` -- the wire format between coordinator and worker (PLAN §3.3).
 
-JSON over HTTP, deliberately boring. Bytes travel as base64 (only `schema_ipc`, used when
-an input has no files, which Phase 2's empty shuffle partitions need). Workers are
+JSON over HTTP, deliberately boring. Bytes travel as base64 (only `schema_ipc`, reserved
+for an input with no files; Phase 2 renders an empty input into the SQL instead). Workers are
 stateless between tasks: everything a task needs is in its spec, except credentials,
 which a worker takes from its own environment (decision 20).
 """
@@ -13,9 +13,13 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
-__all__ = ["InputSpec", "OutputFile", "SinkSpec", "TaskResult", "TaskSpec"]
+__all__ = ["PARTITION_COLUMN", "InputSpec", "OutputFile", "SinkSpec", "TaskResult", "TaskSpec"]
 
-SINK_KINDS = ("result",)  # "shuffle" arrives in Phase 2, "iceberg_files" in Phase 5
+#: The column a shuffle stage's SQL computes as `hash(keys) % partitions`; DuckDB's
+#: `PARTITION_BY` writes one `__part=<p>` directory per value.
+PARTITION_COLUMN = "__part"
+
+SINK_KINDS = ("result", "shuffle")  # "iceberg_files" arrives in Phase 5
 
 
 def _require(data: Mapping[str, Any], key: str, kind: type | tuple[type, ...]) -> Any:
@@ -54,17 +58,24 @@ class InputSpec:
 
 @dataclass(frozen=True)
 class SinkSpec:
-    """Where a task's output goes. Phase 1 has one kind, `result`: parquet under `location`."""
+    """Where a task's output goes: parquet files under `location`.
+
+    `result`: the rows as they are. `shuffle`: the stage SQL carries an `__part` column
+    (`hash(keys) % partitions`) and the rows are written one directory per partition
+    value; with `partitions == 1` there is no `__part` column and one directory.
+    """
 
     kind: str
     location: str
     target_file_bytes: int = 256 * 1024**2
+    partitions: int = 1
 
     def to_json(self) -> dict[str, Any]:
         return {
             "kind": self.kind,
             "location": self.location,
             "target_file_bytes": self.target_file_bytes,
+            "partitions": self.partitions,
         }
 
     @classmethod
@@ -76,6 +87,7 @@ class SinkSpec:
             kind=kind,
             location=_require(data, "location", str),
             target_file_bytes=int(data.get("target_file_bytes", 256 * 1024**2)),
+            partitions=int(data.get("partitions", 1)),
         )
 
 
@@ -123,21 +135,34 @@ class TaskSpec:
 
 @dataclass(frozen=True)
 class OutputFile:
-    """One file a task wrote, as DuckDB's `RETURN_STATS` reported it."""
+    """One file a task wrote, as DuckDB's `RETURN_STATS` reported it.
+
+    `partition` is the shuffle partition the file belongs to; None for a result file.
+    """
 
     path: str
     bytes: int
     rows: int
+    partition: int | None = None
 
     def to_json(self) -> dict[str, Any]:
-        return {"path": self.path, "bytes": self.bytes, "rows": self.rows}
+        out: dict[str, Any] = {"path": self.path, "bytes": self.bytes, "rows": self.rows}
+        if self.partition is not None:
+            out["partition"] = self.partition
+        return out
 
     @classmethod
     def from_json(cls, data: Mapping[str, Any]) -> OutputFile:
+        partition = data.get("partition")
+        if partition is not None and (
+            not isinstance(partition, int) or isinstance(partition, bool)
+        ):
+            raise ValueError(f"field 'partition' has type {type(partition).__name__}")
         return cls(
             path=_require(data, "path", str),
             bytes=_require(data, "bytes", int),
             rows=_require(data, "rows", int),
+            partition=partition,
         )
 
 

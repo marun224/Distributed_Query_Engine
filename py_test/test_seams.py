@@ -83,7 +83,7 @@ def test_helpers_icefleet_imports() -> None:
     assert params(builder.collect_source_keys) == ["expression"]
     assert params(source_sql.build_source) == ["plan", "parameters", "register"]
     assert hasattr(analysis.PlanAnalyzer, "connection")
-    for method in ("ensure_object_store", "cursor", "arrow", "record_batches"):
+    for method in ("ensure_object_store", "cursor", "arrow", "record_batches", "register"):
         assert hasattr(engine_module.DuckDBEngine, method), method
 
 

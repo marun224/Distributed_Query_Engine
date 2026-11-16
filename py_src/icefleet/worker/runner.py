@@ -18,7 +18,7 @@ from typing import TYPE_CHECKING, Any
 import duckdb
 
 from icefleet.plan.tasks import TaskResult
-from icefleet.worker.sinks import write_result
+from icefleet.worker.sinks import write_result, write_shuffle
 
 if TYPE_CHECKING:
     from icetl.exec.engine import DuckDBEngine
@@ -55,8 +55,8 @@ class TaskRunner:
     def run(self, spec: TaskSpec) -> TaskResult:
         for name, source in spec.inputs.items():
             if not source.paths:
-                # Phase 2's empty shuffle partitions bind `schema_ipc` instead; until a
-                # stage can produce one, an empty input is a coordinator bug.
+                # An input with no rows is rendered into the stage SQL as a typed empty
+                # relation by the coordinator; a bound input without files is its bug.
                 raise TaskFailed(f"{spec.key}: input {name!r} has no files")
 
         locations = [p for source in spec.inputs.values() for p in source.paths]
@@ -70,9 +70,12 @@ class TaskRunner:
             self._running[spec.query_id].append(cursor)
         started = time.perf_counter()
         try:
-            if spec.sink.kind != "result":  # pragma: no cover - TaskSpec.from_json refuses it
+            if spec.sink.kind == "result":
+                manifest = write_result(cursor, spec.sql, parameters, spec.sink)
+            elif spec.sink.kind == "shuffle":
+                manifest = write_shuffle(cursor, spec.sql, parameters, spec.sink)
+            else:  # pragma: no cover - TaskSpec.from_json refuses it
                 raise TaskFailed(f"{spec.key}: sink {spec.sink.kind!r} is not implemented")
-            manifest = write_result(cursor, spec.sql, parameters, spec.sink)
         except duckdb.Error as exc:
             with self._lock:
                 cancelled = spec.query_id in self._cancelled

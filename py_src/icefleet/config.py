@@ -10,6 +10,7 @@ a CI job can be configured without code.
     icefleet.fallback             single-node | error
     icefleet.split.targetBytes    bytes of selected columns per split
     icefleet.split.max            the most splits one scan is cut into
+    icefleet.shuffle.partitions   hash partitions of a grouped aggregate's shuffle
     icefleet.worker.slots         task slots per local[N] worker
     icefleet.local.threads        DuckDB threads per local[N] worker
     icefleet.local.memoryLimit    DuckDB memory_limit per local[N] worker
@@ -49,6 +50,7 @@ ENV_KEYS: dict[str, str] = {
     "icefleet.fallback": "ICEFLEET_FALLBACK",
     "icefleet.split.targetBytes": "ICEFLEET_SPLIT_TARGET_BYTES",
     "icefleet.split.max": "ICEFLEET_SPLIT_MAX",
+    "icefleet.shuffle.partitions": "ICEFLEET_SHUFFLE_PARTITIONS",
     "icefleet.worker.slots": "ICEFLEET_WORKER_SLOTS",
     "icefleet.local.threads": "ICEFLEET_LOCAL_THREADS",
     "icefleet.local.memoryLimit": "ICEFLEET_LOCAL_MEMORY_LIMIT",
@@ -71,6 +73,7 @@ class FleetSettings:
     fallback: Fallback = "single-node"
     split_target_bytes: int = 128 * MiB
     split_max: int = 4096
+    shuffle_partitions: int = 64
     worker_slots: int = 2
     local_threads: int | None = None
     local_memory_limit: str | None = None
@@ -179,6 +182,7 @@ def resolve_fleet_settings(
         fallback="error" if fallback == "error" else "single-node",
         split_target_bytes=size("icefleet.split.targetBytes", defaults.split_target_bytes),
         split_max=whole("icefleet.split.max", defaults.split_max),
+        shuffle_partitions=whole("icefleet.shuffle.partitions", defaults.shuffle_partitions),
         worker_slots=whole("icefleet.worker.slots", defaults.worker_slots),
         local_threads=_as_int(threads, key="icefleet.local.threads") if threads else None,
         local_memory_limit=pick("icefleet.local.memoryLimit") or None,
