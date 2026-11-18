@@ -9,12 +9,12 @@ Update at the end of every session. Design lives in
 | | |
 |---|---|
 | Last updated | 2026-11-18 |
-| Current phase | **Phase 4 — Windows, ordering, set operations, grouping sets: built, gate green, awaiting owner confirmation** (Phase 3 confirmed 2026-11-18) |
-| Last updated (git) | 2026-11-16: Phase 1 committed (`fb937a7`) and pushed to the new **public** repo https://github.com/marun224/Distributed_Query_Engine (`origin`, `main` tracks `origin/main`). **Phase 2 committed on `main`** at the owner's request ("pls commit phase 2", 2026-11-16; `88fc616`). **Pushed:** checked 2026-11-18 with `git ls-remote`, GitHub's `main` is `88fc616`. **Phase 3 committed on `main`** at the owner's request ("pls commit pahse 3 changes", 2026-11-18; the commit after `88fc616`, see `git log`). **Not pushed.** **Phase 4 committed on `main`** at the owner's request ("pls commit phase 4 chnages to git", 2026-11-18; the commit after `0330d62`). **Not pushed** |
-| Next action | **Owner to confirm Phase 4** (and say whether to push); then the Phase 5 kickoff questions |
-| Next phase | Phase 5 — Distributed writes, one commit |
+| Current phase | **Phase 5 — Distributed writes: built, gate green, awaiting owner confirmation** (Phase 4 confirmed 2026-11-18) |
+| Last updated (git) | 2026-11-16: Phase 1 committed (`fb937a7`) and pushed to the new **public** repo https://github.com/marun224/Distributed_Query_Engine (`origin`, `main` tracks `origin/main`). **Phase 2 committed on `main`** at the owner's request ("pls commit phase 2", 2026-11-16; `88fc616`). **Pushed:** checked 2026-11-18 with `git ls-remote`, GitHub's `main` is `88fc616`. **Phase 3 committed on `main`** at the owner's request ("pls commit pahse 3 changes", 2026-11-18; the commit after `88fc616`, see `git log`). **Not pushed.** **Phase 4 committed on `main`** at the owner's request ("pls commit phase 4 chnages to git", 2026-11-18; `8325d38`). **Phases 3 and 4 pushed** 2026-11-18 at the owner's request ("pls push"): GitHub's `main` is `8325d38` (checked with `git ls-remote`) |
+| Next action | **Owner to confirm Phase 5** (and say whether to commit / push it); then the Phase 5b kickoff questions |
+| Next phase | Phase 5b — Row-level operations (DELETE / UPDATE / MERGE) |
 | Blocked on | Owner confirmation only |
-| Gate | **`.\scripts\dev.ps1 uv run tox` green on 2026-11-18** (Phase 4): lint · type · py312 **755 passed** · dist, 219 s (the tests alone 3 min 20 s, over plan §9's 3-minute target -- Known gaps). Proof of life `scripts/smoke_cluster.py` on the dev catalog: **OK** for all eight queries (projection, aggregate, join broadcast / shuffled, window, rollup, union, range sort). The Windows `.venv` gate is not authoritative (decision 28) |
+| Gate | **`.\scripts\dev.ps1 uv run tox` green on 2026-11-18** (Phase 5): lint · type · py312 **820 passed** · dist, 190 s (tests 2 min 54 s). Proof of life: `scripts/smoke_cluster.py` (eight read queries, Phase 4) and **`scripts/smoke_write.py` OK** -- five writes of a month of trips into `icefleet_it`, each equal to icetl. The Windows `.venv` gate is not authoritative (decision 28) |
 
 ## Phases
 
@@ -24,8 +24,8 @@ Update at the end of every session. Design lives in
 | 1 | Worker (HTTP), `local[N]`, splits, scan-only stages, fallback, proof of life on the dev catalog | **done** | 2026-11-15 | **yes, 2026-11-16** |
 | 2 | Exchange (shuffle) + two-phase aggregation + explain DAG | **done** | 2026-11-16 | **yes, 2026-11-18** |
 | 3 | Joins: broadcast and shuffle hash | **done** | 2026-11-18 | **yes, 2026-11-18** |
-| 4 | Windows, distributed ORDER BY (range partitioning), OFFSET, set operations, grouping sets | **built — awaiting confirmation** | 2026-11-18 | pending |
-| 5 | Distributed writes, one commit; 5b row-level operations | not started | — | — |
+| 4 | Windows, distributed ORDER BY (range partitioning), OFFSET, set operations, grouping sets | **done** | 2026-11-18 | **yes, 2026-11-18** |
+| 5 | Distributed writes, one commit; 5b row-level operations | **5 built — awaiting confirmation**; 5b not started | 2026-11-18 | pending |
 | 6 | Container image, Kubernetes manifests, Argo fleet-per-workflow, integration tier, benchmarks (decision 27) | not started | — | — |
 | 6b | Argo as a scheduler backend: pod per task (`ArgoScheduler`, `icefleet-worker run-task`) | not started | — | — |
 | 7 | Task retry (thread-pool backend), adaptive partitions, skew, renamed-column splits, `explain(analyze)` | not started | — | — |
@@ -115,7 +115,25 @@ Update at the end of every session. Design lives in
 | 4.7 | Tests: `test_windows.py` (21 window shapes + icetl's 21 window cases on new fixtures `ties` / `gaps` / `groups`), `test_setops.py`, `test_ordering.py` (range sort incl. ties, OFFSET, top-n subqueries, grouping sets, aggregate over aggregate); unit: Phase 4 shapes, grouping sets in plain DuckDB through the real sink, the range partitioner (hypothesis + 8 types x directions x NULL placement), the sample sink | **done** | 755 tests (+247) |
 | 4.8 | `smoke_cluster.py`: window, rollup, union, sorted on `nyc.yellow_tripdata` | **done** | all equal to icetl, the sort checked key by key; the four earlier queries rerun green |
 | 4.9 | Docs: plan v1.6 (§4.2 grouping-set row, §4.4, §5, §6 "As built"), `divergence.md`, README | **done** | |
-| 4.10 | Owner confirms Phase 4 | **pending** | |
+| 4.10 | Owner confirms Phase 4 | **done** | 2026-11-18, "Phase 4 confirmed" (after the checklist was shown); committed `8325d38` and pushed with Phase 3 |
+
+## Phase 5 checklist
+
+| # | Task | Status | Notes |
+|---|---|---|---|
+| 5.0 | Kickoff questions (7) answered | **done** | owner: "yes to all" (2026-11-18); recorded in plan §6 Phase 5 "As built" |
+| 5.1 | Spike: icetl's writer; DuckDB-written files committed with PyIceberg 0.11.1 `add_files` (throwaway SqlCatalog in `/tmp`, dev catalog untouched) | **done** | every SQL write (INSERT INTO / OVERWRITE, CTAS) goes through `df.write`, and icetl **materialises** the whole result as one Arrow table before writing; DuckDB `COPY ... FIELD_IDS {...}` writes ids for nested types too (`{__duckdb_field_id: n, child: m}`, list `element`, map `key` / `value`); **PyIceberg renumbers nested field ids at `create_table`**, so ids must come from the created table's schema; `add_files` reads each footer, infers partition values from the statistics (identity and `day(ts)` both), refuses a type that differs from the table's (`decimal(21,1)` for `double`) and a file already in the table, and **accepts a file missing the partition column, recording NULL** -- so partition columns must always be written; append = 1 snapshot; overwrite / dynamic overwrite = delete + `add_files` in one transaction = one commit, **2 snapshots** (delete, append) -- exactly what icetl's own `table.overwrite` makes |
+| 5.2 | `write/target.py`: Iceberg -> DuckDB types, FIELD_IDS from the table's schema, a grouping value per partition field (`hash(c)` identity, Iceberg ordinals for year / month / day / hour, UTC for timestamptz) | **done** | hypothesis: DuckDB's value equals PyIceberg's transform either side of 1970 |
+| 5.3 | `iceberg_files` sink (`worker/sinks.py`), `SinkSpec.field_ids` / `.partition_columns`; a sink without field ids refused | **done** | one COPY per task; partitioned: one directory per value, the grouping not written |
+| 5.4 | `plan/stages.py` `_plan_write`: cast to the table, shuffle by partition values, write; LIMIT / OFFSET through a top-n first | **done** | |
+| 5.5 | `write/commit.py`: append / overwrite / dynamic in one transaction, `commit_with_retry` | **done** | |
+| 5.6 | `write/writer.py` `ClusterDataFrameWriter` + `DataFrame.write` seam; PyIceberg's schema check; fallbacks; failed writes discard their files, a failed `saveAsTable` drops its table; `_last_write` | **done** | seams pinned in `test_seams.py` |
+| 5.7 | Tests: `test_writes.py` (twin tables written by the cluster and by icetl: create, partitioned, append / overwrite snapshots, dynamic, insertInto, SQL INSERT / CTAS, nested / join / aggregate / limit / union, six time transforms, fallbacks, modes, refusals, failure clean-up, renames); `test_write.py` (transforms, types, field ids, retry, sink) | **done** | 820 tests (+65) |
+| 5.8 | `scripts/smoke_write.py` on the dev catalog | **done** | all five steps equal to icetl; one file per partition value written |
+| 5.9 | Docs: plan v1.7, `divergence.md`, README | **done** | |
+| 5.10 | Owner confirms Phase 5 | **pending** | |
+
+
 
 ## Open decisions
 
@@ -148,7 +166,7 @@ Update at the end of every session. Design lives in
 | Auth / TLS between processes | unscheduled | decision 20 |
 | Web UI | unscheduled | decision 21 |
 | Row-group-level splits | unscheduled | decision 6 |
-| Non-identity partition transforms on write | Phase 5 follow-up | needs Iceberg transforms in SQL |
+| `bucket` / `truncate` partition transforms on write (identity, year, month, day, hour are distributed since Phase 5) | Phase 5 follow-up | `bucket` needs Iceberg's murmur3 hash in SQL; until then icetl's writer runs them single-node |
 | Python UDFs on the cluster | Phase 8 | decision 9 |
 | Streaming exchange (Arrow IPC over HTTP; Flight where it loads) | Phase 8 | decisions 2, 26 |
 
@@ -193,8 +211,17 @@ No known wrong answers. Limits by design and environment issues:
 - **A range sort can be chosen where it does not pay:** a join's size is unknown, so an
   ORDER BY without a LIMIT over a join always range-sorts, two more stages even for a
   small result. Measuring the input at run time is Phase 7's.
-- **The offline suite takes 3 min 20 s** with the Phase 4 suites, over plan §9's 3-minute
-  target; fewer cluster parametrisations for the newest suites is the cheap fix.
+- **The offline suite took 3 min 20 s** after Phase 4, 2 min 54 s at Phase 5 (machine
+  load varies); plan §9's target is 3 minutes.
+- **A write's leftovers after a coordinator crash:** files written under
+  `<table>/data/icefleet/<query>/` before the crash are referenced by nothing; Iceberg's
+  orphan-file removal (or `icefleet-admin gc`, Phase 7) clears them. A failed write the
+  coordinator survives removes its own. A task with no rows of an unpartitioned table
+  still leaves one empty, uncommitted file under that prefix.
+- **Still icetl's single-node writer (Phase 5 "As built"):** `mergeSchema`, `bucket` /
+  `truncate` partitions, `time` / `uuid` / `fixed` / nanosecond columns, a dynamic
+  overwrite of a transform-partitioned table (PyIceberg's own limit), a write whose
+  query runs single-node. Row-level DELETE / UPDATE / MERGE is Phase 5b.
 - **Join sizes are upper bounds, and loose for a self-join** (kickoff answer 2): icetl plans one
   `ScanPlan` per table for all its references, pruned by the union of their filters, so a
   small aggregate of the same table is bounded by the whole scan and is not broadcast at

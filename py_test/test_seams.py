@@ -91,3 +91,36 @@ def test_build_source_still_names_the_file_list_parameter_paths_0() -> None:
     """plan_stages binds `<view>_paths_0`; icetl must still call the one group that."""
     source = inspect.getsource(source_sql.build_source)
     assert 'f"{view}_paths_{index}"' in source
+
+
+def test_the_write_seams() -> None:
+    """Phase 5 replaces `DataFrameWriter._save` and `_derive`, wraps `DataFrame.write`,
+    reads the writer's settings, and calls PyIceberg's private schema check."""
+    from icetl.sql import writer
+    from pyiceberg.io import pyarrow as iceberg_arrow
+
+    assert params(writer.DataFrameWriter._save) == ["self", "name", "insert_into", "overwrite"]
+    assert params(writer.DataFrameWriter._derive) == ["self", "changes"]
+    for method in (
+        "_merges_schema",
+        "_dynamic_partitions",
+        "_apply_partitioning",
+        "_apply_sort_order",
+    ):
+        assert hasattr(writer.DataFrameWriter, method), method
+    source = inspect.getsource(writer.DataFrameWriter.__init__)
+    for attribute in ("_df", "_mode", "_options", "_partition_by", "_sort_by", "_properties"):
+        assert f"self.{attribute} =" in source, attribute
+    assert params(writer.commit_with_retry) == ["operation"]
+    assert params(writer.iceberg_ready) == ["data"]
+    write = DataFrame.write
+    original = getattr(write, "__wrapped__", write)
+    assert isinstance(original, property)
+    assert params(iceberg_arrow._check_pyarrow_schema_compatible) == [
+        "requested_schema",
+        "provided_schema",
+        "downcast_ns_timestamp_to_us",
+        "format_version",
+    ]
+    for method in ("_invalidate_source",):
+        assert hasattr(Session, method), method

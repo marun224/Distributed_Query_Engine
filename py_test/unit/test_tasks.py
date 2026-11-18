@@ -75,7 +75,8 @@ def test_a_shuffle_sink_and_partitioned_files_round_trip() -> None:
         {"stage_id": "0"},
         {"sql": None},
         {"inputs": []},
-        {"sink": {"kind": "iceberg_files", "location": "/x"}},
+        {"sink": {"kind": "parquet_files", "location": "/x"}},
+        {"sink": {"kind": "iceberg_files", "location": "/x"}},  # no field ids
         {"task_index": True},
     ],
 )

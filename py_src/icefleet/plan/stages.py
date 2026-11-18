@@ -30,6 +30,9 @@ hands:
     UNION / INTERSECT / EXCEPT   both sides hashed on every column, then per partition
     ORDER BY    at the top, without a LIMIT, over more than icefleet.sort.coordinatorBytes:
                 a range sort (`plan/sort.py`)
+    a write     (Phase 5) the result cast to the table's types; a partitioned table's rows
+                shuffled by their partition values first, so each value is written by one
+                task; every final task writes Iceberg data files (`write/target.py`)
 
 Every table *reference* is its own split input, so a self-join reads its table twice,
 in two stages, and a stage never binds two file lists to one icetl parameter. A stage's
@@ -102,6 +105,7 @@ if TYPE_CHECKING:
 
     from icefleet.config import FleetSettings
     from icefleet.exchange.base import Exchange
+    from icefleet.write.target import WriteTarget
 
 __all__ = [
     "Fetch",
@@ -178,6 +182,7 @@ class Stage:
     sample_columns: tuple[str, ...] = ()  # a range sort's keys, sampled by every task
     sample_rows: int = 0
     range: RangeSpec | None = None
+    write: WriteTarget | None = None  # an `iceberg_files` sink writes into this table
 
     @property
     def table(self) -> str:
@@ -260,20 +265,32 @@ class Stage:
                     inputs[item.parameter] = InputSpec(paths=paths)
                 else:
                     sql = sql.replace(item.token, item.empty)
-            return TaskSpec(
-                query_id=query_id,
-                stage_id=self.stage_id,
-                task_index=index,
-                sql=sql,
-                inputs=inputs,
-                sink=SinkSpec(
+            if self.write is not None:
+                # The table's own data directory, a prefix per query: removed whole if the
+                # write fails, referenced by the table once it commits.
+                sink = SinkSpec(
+                    kind="iceberg_files",
+                    location=f"{self.write.location}/{query_id}/stage-{self.stage_id}/task-{index}",
+                    target_file_bytes=self.write.target_file_bytes,
+                    field_ids=self.write.field_ids,
+                    partition_columns=self.write.hidden,
+                )
+            else:
+                sink = SinkSpec(
                     kind=self.sink,
                     location=exchange.task_location(query_id, self.stage_id, index),
                     target_file_bytes=target_file_bytes,
                     partitions=self.partitions,
                     sample_columns=self.sample_columns,
                     sample_rows=self.sample_rows,
-                ),
+                )
+            return TaskSpec(
+                query_id=query_id,
+                stage_id=self.stage_id,
+                task_index=index,
+                sql=sql,
+                inputs=inputs,
+                sink=sink,
             )
 
         if self.scan is not None:
@@ -309,6 +326,7 @@ class StagePlan:
     offset: int = 0
     final_stages: tuple[int, ...] = ()
     ranged: bool = False
+    write: WriteTarget | None = None  # the final stages write Iceberg data files into it
 
     @property
     def final(self) -> Stage:
@@ -602,6 +620,7 @@ class _Planner:
         partitions: int,
         notes: Sequence[str],
         sample: tuple[str, ...] = (),
+        write: WriteTarget | None = None,
     ) -> Stage:
         """Make `tree` -- `pipe`'s work, ready to write -- a stage of its own."""
         assert not pipe.branches
@@ -623,6 +642,7 @@ class _Planner:
                 notes=tuple(notes),
                 sample_columns=sample,
                 sample_rows=self.fleet.sort_sample_rows if sample else 0,
+                write=write,
             )
         )
 
@@ -1554,8 +1574,10 @@ def plan_stages(
     register: Callable[[str, Any], None] = _no_register,
     udf_names: Collection[str] = (),
     aggregate_names: Collection[str] = (),
+    write: WriteTarget | None = None,
 ) -> StagePlan | Uncuttable:
-    """Cut `compiled` into stages, or say why it cannot be cut.
+    """Cut `compiled` into stages, or say why it cannot be cut. With `write`, the final
+    stages write the result into that table instead of returning it (Phase 5).
 
     `describe` types a SELECT over the plan's sources (DuckDB's DESCRIBE against icetl's
     zero-row views); `aggregate_names` is DuckDB's catalog of aggregate functions.
@@ -1603,6 +1625,8 @@ def plan_stages(
         aggregate_names=aggregate_names,
     )
     try:
+        if write is not None:
+            return _plan_write(planner, query, list(output_names), write)
         return _plan(planner, query, list(output_names))
     except _Untypable as exc:
         return Uncuttable(f"the stage planner could not type a stage ({exc})")
@@ -1729,4 +1753,85 @@ def _plan(planner: _Planner, query: Query, output_names: list[str]) -> StagePlan
         offset=query.offset,
         final_stages=(sorter.stage_id,),
         ranged=True,
+    )
+
+
+def _plan_write(
+    planner: _Planner, query: Query, output_names: list[str], target: WriteTarget
+) -> StagePlan | Uncuttable:
+    """The stages that write the query's result into `target` (PLAN §4.6, kickoff answer 3).
+
+    The result's order means nothing to a table, so a top-level ORDER BY is dropped; a
+    LIMIT / OFFSET still decides *which* rows, so it is applied first, through one
+    partition. Each branch of the result is cast to the table's columns (a column the
+    frame lacks is NULL); a partitioned table's rows are then shuffled by their partition
+    values, so every value is written by one task, into one file per task and value.
+    """
+    node: RelNode = query.root
+    if query.limit is not None or query.offset:
+        node = TopN(
+            child=query.root,
+            order=query.order,
+            limit=query.limit,
+            offset=query.offset,
+            columns=tuple(output_names),
+        )
+    root = planner.plan(node)
+    hidden = target.hidden
+
+    def shaped(leaf: _Pipe) -> _Pipe:
+        casts = [
+            _alias(
+                cast_to(_column(source) if source is not None else exp.null(), kind),
+                name,
+            )
+            for (name, kind), source in zip(target.columns, target.sources, strict=True)
+        ]
+        select = exp.select(*casts).from_(leaf.relation(planner.fresh("__icefleet_w")))
+        if target.partitions:
+            grouping = [
+                _alias(exp.maybe_parse(value, dialect="duckdb"), name)
+                for value, name in zip(target.partitions, hidden, strict=True)
+            ]
+            select = exp.select(*[_column(name) for name, _ in target.columns], *grouping).from_(
+                exp.Subquery(this=select, alias=_quoted_alias(planner.fresh("__icefleet_v")))
+            )
+        return replace(
+            leaf,
+            body=select,
+            columns=(*[name for name, _ in target.columns], *hidden),
+            hashes=(),
+        )
+
+    pipe = planner.each(root, shaped)
+    shown = "-> Iceberg data files"
+    if target.partitions:
+        types = [kind for name, kind in planner.describe_pipe(pipe) if name in hidden]
+        n = planner.fleet.shuffle_partitions
+        pipe = planner.shuffle(
+            pipe,
+            [_column(name) for name in hidden],
+            [hash_type(kind) for kind in types],
+            n,
+            label="the partition values",
+        )
+        shown += ", a file per partition value"
+    else:
+        shown += f", rolled at {format_bytes(target.target_file_bytes)}"
+    finals = [
+        planner.close(
+            leaf.select(),
+            leaf,
+            sink="result",
+            partitions=1,
+            notes=(*leaf.notes, shown),
+            write=target,
+        )
+        for leaf in pipe.leaves()
+    ]
+    return StagePlan(
+        stages=tuple(planner.stages),
+        columns=tuple(name for name, _ in target.columns),
+        final_stages=tuple(s.stage_id for s in finals),
+        write=target,
     )

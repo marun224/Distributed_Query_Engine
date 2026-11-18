@@ -12,6 +12,12 @@ accepted (PLAN decision 14). Anything not listed here is a bug.
 | 4 | Phase 2 | `LIMIT n` without `ORDER BY` returns *some* n rows; ties under `ORDER BY ... LIMIT n` may be broken differently; rows tied under a range-sorted `ORDER BY` (Phase 4) may come in another order | As on the reference (PLAN §4.7). | tests check membership, or order by unique keys, or check sortedness and the same rows |
 | 5 | Phase 4 | `dropDuplicates(subset)` / `DISTINCT ON` without an `ORDER BY` keeps *some* row per key; a window function whose value depends on the order of tied rows (`row_number()` over a non-unique order) numbers the ties in some order | Nondeterministic on the reference too (icetl says so of `dropDuplicates`). With an `ORDER BY`, `DISTINCT ON` keeps the first row of it, as single-node: that `ORDER BY` stays in its SELECT. | keys and membership only; windows are tested over unique orders |
 
+Differences from icetl, chosen (not distribution's):
+
+- **A failed `saveAsTable` leaves no table** (Phase 5, kickoff answer 5): a table the write
+  created is dropped again when filling it fails, as the reference does. icetl leaves
+  the empty table it created. A table that existed before is never dropped.
+
 Not divergences, by construction:
 
 - **Result types.** Every decomposed aggregate is cast back to the type DuckDB gives it
@@ -23,6 +29,10 @@ Not divergences, by construction:
   *fails* with DuckDB's conversion error rather than returning a different number (P3:
   degrade, never fail wrong).
 - **NULL group keys** form one group, as single-node: `hash(NULL)` is one value.
+- **Writes** (Phase 5) accept and refuse what icetl's writer does -- PyIceberg's own schema
+  check runs first -- create tables with icetl's schema (the same Arrow types, through
+  `iceberg_ready`), and make icetl's snapshots: an append one, an overwrite a delete and
+  an append.
 - **NULL join keys** (Phase 3) never match under `=` and always match under
   `IS NOT DISTINCT FROM`, as single-node; a row an outer join keeps for a NULL key is
   emitted once, by the one task its partition went to. Only a side whose unmatched rows

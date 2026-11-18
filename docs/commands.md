@@ -463,3 +463,42 @@ grep -E "KEY|SECRET|PASSWORD|TOKEN" .env | ... git grep -lIF --untracked   # rea
 git add -A                                                 # (most files were already staged, not by this session)
 git commit -F -                                            # "Phase 4: windows, ordering, set operations, grouping sets"
 ```
+
+## 2026-11-18 — push Phases 3 and 4 (owner: "pls push")
+
+```bash
+git push origin main                    # 88fc616..8325d38  main -> main
+git ls-remote origin refs/heads/main    # 8325d38 -- GitHub's main is the Phase 4 commit
+```
+
+## 2026-11-18 — Phase 4 confirmed ("Phase 4 confirmed"); Phase 5 kickoff and spike (read-only)
+
+```powershell
+# icetl: sql/writer.py (DataFrameWriter, commit_with_retry), sql/session.py _insert, sql/ddl.py CTAS
+docker cp <scratchpad>\p5_spike.py icefleet-dev:/tmp/; .\scripts\dev.ps1 uv run python /tmp/p5_spike.py     # round 1 (two spike bugs)
+docker cp <scratchpad>\p5_spike2.py icefleet-dev:/tmp/; .\scripts\dev.ps1 uv run python /tmp/p5_spike2.py   # round 2
+#   throwaway SqlCatalog warehouses /tmp/p5_spike, /tmp/p5_spike2; the dev catalog was not touched
+# tracker: Phase 4 confirmed, Phase 5 checklist (5.0 asked, 5.1 spike done)
+```
+
+## 2026-11-18 — Phase 5 build (owner: "yes to all" to the 7 kickoff questions)
+
+```powershell
+# New: write/{target,commit,writer}.py; changed: tasks.py, sinks.py, runner.py, stages.py, session.py
+.\scripts\dev.ps1 uv run python -m ruff format py_src; ... ruff check ...; ... mypy     # iterated
+.\scripts\dev.ps1 uv run python -m pytest -q -p no:randomly py_test/cluster/test_writes.py -k local2
+#   conftest import failed: a plain property cannot carry __wrapped__ -> a property subclass
+#   6 failed, test-side: a cached oracle snapshot; _last_run overwritten by icetl's writer's toArrow()
+#   (-> ClusterSession._last_write); a bad CAST is NULL under the reference (-> DuckDB error());
+#   a decimal literal -> 24 passed
+.\scripts\dev.ps1 uv run python -m pytest -q -p no:randomly py_test/unit/test_write.py py_test/test_seams.py   # 28 passed
+.\scripts\dev.ps1 uv run python scripts/smoke_write.py
+#   all five steps equal to icetl; one FAIL was the script's own file count (table-wide, not per write) -> fixed, rerun OK
+curl -s http://localhost:8182/v1/namespaces/icefleet_it/tables    # [] -- both tables purged
+curl -s http://localhost:8182/v1/namespaces/nyc/tables/yellow_tripdata   # 12 snapshots, last-updated 2026-09: untouched
+.\scripts\dev.ps1 uv run tox      # 1 failed: a Phase 1 test used iceberg_files as an unknown sink kind -> fixed
+.\scripts\dev.ps1 uv run tox      # lint/type/py312 (820 passed)/dist OK, 190.2 s -- Phase 5 gate green
+# docs: plan v1.7, task_tracker (Phase 5 built), divergence.md, README
+git status --short; git log --oneline -1   # after a context reset: Phase 5 uncommitted, HEAD 8325d38
+# task_tracker: deferred row for write transforms narrowed to bucket / truncate
+```

@@ -18,7 +18,7 @@ from typing import TYPE_CHECKING, Any
 import duckdb
 
 from icefleet.plan.tasks import TaskResult
-from icefleet.worker.sinks import write_result, write_shuffle
+from icefleet.worker.sinks import write_iceberg_files, write_result, write_shuffle
 
 if TYPE_CHECKING:
     from icetl.exec.engine import DuckDBEngine
@@ -74,6 +74,8 @@ class TaskRunner:
                 manifest = write_result(cursor, spec.sql, parameters, spec.sink)
             elif spec.sink.kind == "shuffle":
                 manifest = write_shuffle(cursor, spec.sql, parameters, spec.sink)
+            elif spec.sink.kind == "iceberg_files":
+                manifest = write_iceberg_files(cursor, spec.sql, parameters, spec.sink)
             else:  # pragma: no cover - TaskSpec.from_json refuses it
                 raise TaskFailed(f"{spec.key}: sink {spec.sink.kind!r} is not implemented")
         except duckdb.Error as exc:

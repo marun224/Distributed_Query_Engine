@@ -21,7 +21,7 @@ if TYPE_CHECKING:
 
     from icefleet.plan.tasks import SinkSpec
 
-__all__ = ["write_result", "write_shuffle"]
+__all__ = ["write_iceberg_files", "write_result", "write_shuffle"]
 
 _PARTITION_DIR = re.compile(r"(?:^|/)__part=(\d+)/")
 
@@ -118,3 +118,36 @@ def write_shuffle(
             )
         )
     return out
+
+
+def write_iceberg_files(
+    cursor: Any, sql: str, parameters: Mapping[str, Any], sink: SinkSpec
+) -> list[OutputFile]:
+    """Run `sql` and write its rows as Iceberg data files under `sink.location` (Phase 5).
+
+    `sink.field_ids` carries the table's field ids, so the files read back by id, the
+    way Iceberg reads (and `add_files` checks them against the table's schema). With
+    `partition_columns`, rows are written one directory per value of those computed
+    grouping columns, which are left out of the files: every file holds one partition,
+    which is what `add_files` reads its partition value from. Without, the rows roll
+    into files of `target_file_bytes`. A file with no rows is not reported: it is not
+    worth a manifest entry.
+    """
+    location = sink.location
+    _prepare(location)
+    options = ["FORMAT parquet", "COMPRESSION zstd"]
+    if sink.partition_columns:
+        listing = ", ".join('"' + c.replace('"', '""') + '"' for c in sink.partition_columns)
+        options += [f"PARTITION_BY ({listing})", "WRITE_PARTITION_COLUMNS false"]
+    else:
+        options.append(f"FILE_SIZE_BYTES {int(sink.target_file_bytes)}")
+    if sink.field_ids:
+        options.append(f"FIELD_IDS {sink.field_ids}")
+    options.append("RETURN_STATS true")
+    copy = f"COPY ({sql}) TO {_quote(location)} ({', '.join(options)})"
+    rows = cursor.execute(copy, dict(parameters)).fetchall()
+    return [
+        OutputFile(path=str(row[0]), rows=int(row[1]), bytes=int(row[2]))
+        for row in rows
+        if int(row[1]) > 0
+    ]

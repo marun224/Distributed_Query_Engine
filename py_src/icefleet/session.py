@@ -12,9 +12,13 @@ the catalog. Only execution changes (PLAN §3.2):
     -> uncuttable: icetl runs it single-node, on this process (P3), unless
                    icefleet.fallback=error
 
-The seams are icetl's private `_execute`, `_stream`, `_compile` and
-`DataFrame._explain_text`, which is why icetl is pinned exactly (PLAN §4.10) and
-`py_test/test_seams.py` checks every one of them.
+Writes (Phase 5) go through `df.write`, which on a ClusterSession is a
+`ClusterDataFrameWriter` (`write/writer.py`): the workers write the data files, this
+process commits them once.
+
+The seams are icetl's private `_execute`, `_stream`, `_compile`, `DataFrame._explain_text`,
+`DataFrame.write` and `DataFrameWriter._save` / `_derive`, which is why icetl is pinned
+exactly (PLAN §4.10) and `py_test/test_seams.py` checks every one of them.
 """
 
 from __future__ import annotations
@@ -53,6 +57,7 @@ if TYPE_CHECKING:
     from pyiceberg.catalog import Catalog
 
     from icefleet.plan.tasks import OutputFile
+    from icefleet.write.target import WriteTarget
 
 __all__ = ["ClusterSession"]
 
@@ -124,6 +129,9 @@ class ClusterSession(Session):
         self._exchange: Exchange | None = None
         self._owned_exchange_dir: str | None = None
         self._last_run: QueryRun | None = None
+        # How the last write ran: icetl's own writer reads its frame with `toArrow()`,
+        # which sets `_last_run` to that read, so a write keeps its own record.
+        self._last_write: QueryRun | None = None
         self._aggregate_names: frozenset[str] | None = None
 
     def __repr__(self) -> str:
@@ -212,6 +220,8 @@ class ClusterSession(Session):
         plan: exp.Expression,
         sources: Mapping[str, ScanSource],
         output_names: Sequence[str],
+        *,
+        write: WriteTarget | None = None,
     ) -> StagePlan | Uncuttable:
         compiled = self._compile(plan, sources, output_names)
         _, slots = self._cluster_shape()
@@ -227,6 +237,7 @@ class ClusterSession(Session):
             register=self._engine.register,
             udf_names=udfs,
             aggregate_names=self._duckdb_aggregates(),
+            write=write,
         )
 
     def _describe_distributed(
@@ -397,6 +408,97 @@ class ClusterSession(Session):
         table = self._engine.arrow(sql, dict(parameters))
         return [tuple(row.values()) for row in table.to_pylist()]
 
+    # -- writes (Phase 5) -------------------------------------------------------
+
+    def _write_reason(self, df: DataFrame) -> str | None:
+        """Why the query behind a write cannot be distributed, or None when it can."""
+        staged = self._stage_plan(df._plan, df._sources, df.columns)
+        return staged.reason if isinstance(staged, Uncuttable) else None
+
+    def _empty_result(self, df: DataFrame) -> pa.Table:
+        """The result with no rows, as this session's own engine hands it out: the Arrow
+        types icetl's writer would have seen from `toArrow()`, without running the query."""
+        compiled = self._compile(df._plan, df._sources, df.columns)
+        parameters = dict(compiled.parameters)
+        paths = [p for v in parameters.values() if isinstance(v, list) for p in v]
+        self._engine.ensure_object_store([str(p) for p in paths])
+        return self._engine.arrow(f"SELECT * FROM ({compiled.sql}) LIMIT 0", parameters)
+
+    def _write_single_node(self, reason: str) -> None:
+        """A write goes to icetl's writer: say so, or refuse (`icefleet.fallback=error`)."""
+        from icefleet.write.writer import refuse
+
+        if self._fleet().fallback == "error":
+            raise refuse(reason)
+        logger.info("single-node write: %s", reason)
+        self._last_write = QueryRun(mode="single-node", reason=reason)
+
+    def _write_files(
+        self, df: DataFrame, target: WriteTarget
+    ) -> tuple[list[OutputFile], Callable[[], None]] | Uncuttable:
+        """Run the stages that write `df` into `target`; their data files, and how to
+        delete them again if the commit does not happen. A failed run deletes its own."""
+        staged = self._stage_plan(df._plan, df._sources, df.columns, write=target)
+        if isinstance(staged, Uncuttable):
+            return staged
+        fleet = self._fleet()
+        cluster = self._ensure_cluster()
+        exchange = self._ensure_exchange()
+        written = open_exchange(target.location, self._settings.s3)
+        query_id = f"q-{uuid.uuid4().hex[:12]}"
+        scheduler = ThreadPoolScheduler(
+            cluster, target_file_bytes=fleet.result_file_bytes, fetch=self._fetch
+        )
+
+        def discard() -> None:
+            try:
+                written.delete_query(query_id)
+            except Exception as exc:  # never mask the write's own outcome
+                logger.warning("could not remove the files of failed write %s: %s", query_id, exc)
+
+        try:
+            results = scheduler.run(staged, query_id=query_id, exchange=exchange)
+        except BaseException:
+            discard()
+            raise
+        finally:
+            if not fleet.exchange_keep:
+                try:
+                    exchange.delete_query(query_id)
+                except Exception as exc:
+                    logger.warning("could not remove the exchange prefix of %s: %s", query_id, exc)
+        files = [f for r in results if r.stage_id in staged.finals for f in r.data]
+        self._last_write = self._last_run = QueryRun(
+            mode="distributed",
+            query_id=query_id,
+            stages=len(staged.stages),
+            tasks=len(results),
+            stage_tasks=tuple(
+                sum(1 for r in results if r.stage_id == stage.stage_id) for stage in staged.stages
+            ),
+            files=len(files),
+            rows=sum(f.rows for f in files),
+        )
+        return files, discard
+
+    def _partitions_written(
+        self, files: Sequence[OutputFile], columns: Sequence[str]
+    ) -> list[dict[str, Any]]:
+        """The distinct identity-partition values of the written files (a dynamic
+        overwrite replaces exactly these partitions)."""
+        if not files or not columns:
+            return []
+        listing = ", ".join(
+            exp.to_identifier(c, quoted=True).sql(dialect="duckdb") for c in columns
+        )
+        paths = [f.path for f in files]
+        sql = (
+            f"SELECT DISTINCT {listing} FROM read_parquet(${_RESULT_PARAMETER}, "
+            f"union_by_name => false, hive_partitioning => false)"
+        )
+        rows = self._fetch(sql, {_RESULT_PARAMETER: paths})
+        return [dict(zip(columns, row, strict=True)) for row in rows]
+
     # -- lifecycle ---------------------------------------------------------
 
     def stop(self) -> None:
@@ -432,3 +534,31 @@ def _explain_text(self: DataFrame, *, verbose: bool) -> str:
 
 _explain_text.__wrapped__ = _ORIGINAL_EXPLAIN_TEXT  # type: ignore[attr-defined]
 setattr(DataFrame, "_explain_text", _explain_text)  # noqa: B010 - a method, deliberately
+
+
+# -- df.write: the write seam (Phase 5) --------------------------------------------
+#
+# icetl's `DataFrame.write` property hard-codes `DataFrameWriter(self)`; frames of a
+# ClusterSession get the cluster writer instead, every other frame icetl's own.
+
+_ORIGINAL_WRITE = getattr(DataFrame.write, "__wrapped__", DataFrame.write)
+
+
+def _write(self: DataFrame) -> Any:
+    if isinstance(self._session, ClusterSession):
+        from icefleet.write.writer import ClusterDataFrameWriter
+
+        return ClusterDataFrameWriter(self)
+    return _ORIGINAL_WRITE.fget(self)  # type: ignore[union-attr]
+
+
+class _WriteProperty(property):
+    """A property that remembers the one it replaced (a plain one cannot), so a
+    re-import wraps icetl's original, not this."""
+
+    __wrapped__: Any
+
+
+_cluster_write = _WriteProperty(_write, doc=_ORIGINAL_WRITE.__doc__)
+_cluster_write.__wrapped__ = _ORIGINAL_WRITE
+setattr(DataFrame, "write", _cluster_write)  # noqa: B010 - a property, deliberately

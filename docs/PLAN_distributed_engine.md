@@ -1,6 +1,6 @@
 # icefleet — a distributed SQL and DataFrame engine over Apache Iceberg, executed by a fleet of DuckDB workers
 
-**Status:** Draft v1.6 — 2026-11-18, decisions locked (§2); v1.1 adds decision 26 (HTTP control plane) and decision 27 (Kubernetes + Argo Workflows as the deployment target); v1.2 adds decision 28 (development in a Linux dev container); v1.3 records Phase 1 as built (§6), corrects §4.6 (DuckDB writes field ids) and extends the seam table (§4.10); v1.4 records Phase 2 as built (§6), corrects §4.1 (DuckDB hashes integers by width) and §4.4 (shuffle files are not rolled), extends §4.10 and §5; v1.5 records Phase 3 as built (§6), corrects §4.3 (join strategy chosen when planning, from upper bounds) and §4.4 (broadcast), updates §5; v1.6 records Phase 4 as built (§6), extends §4.4 (range sort, samples) and §5, and replaces §4.2's grouping-set row (one shuffle, not one per set)
+**Status:** Draft v1.7 — 2026-11-18, decisions locked (§2); v1.1 adds decision 26 (HTTP control plane) and decision 27 (Kubernetes + Argo Workflows as the deployment target); v1.2 adds decision 28 (development in a Linux dev container); v1.3 records Phase 1 as built (§6), corrects §4.6 (DuckDB writes field ids) and extends the seam table (§4.10); v1.4 records Phase 2 as built (§6), corrects §4.1 (DuckDB hashes integers by width) and §4.4 (shuffle files are not rolled), extends §4.10 and §5; v1.5 records Phase 3 as built (§6), corrects §4.3 (join strategy chosen when planning, from upper bounds) and §4.4 (broadcast), updates §5; v1.6 records Phase 4 as built (§6), extends §4.4 (range sort, samples) and §5, and replaces §4.2's grouping-set row (one shuffle, not one per set); v1.7 records Phase 5 as built (§6), §4.6 as built (one commit, not one snapshot; time transforms), extends §4.10 and §5
 **Owner:** Arun
 **Base:** [`icetl`](https://github.com/marun224/data_transformation_engine) 0.1.0 — single-node, sqlglot IR, PyIceberg planning, DuckDB execution. Local checkout: `E:\workspace\Transformation_Engine_08172026`.
 **State of the work:** [task_tracker.md](task_tracker.md). This file is the design; it does not say what is done.
@@ -439,6 +439,25 @@ The final stage's sink is `iceberg_files`:
 Why field ids matter enough to write them ourselves: DuckDB's `COPY` does not write them, and a file without them is correct only through a name mapping that not every reader honours.
 
 > **Correction, 2026-11-15 (owner agreed at the Phase 1 kickoff):** DuckDB 1.5.6's `COPY ... (FORMAT parquet, FIELD_IDS {col: id, ...})` *does* write `PARQUET:field_id` (measured: `parquet_schema()` reads them back). So Phase 5 should write data files with DuckDB, which keeps P4 and keeps pyarrow's Parquet writer off the workers. Steps 2–3 above become `COPY ... FIELD_IDS` with `FILE_SIZE_BYTES` rolling and `RETURN_STATS` for the manifest; nested field ids use DuckDB's `__duckdb_field_id` form. To be confirmed against `add_files` and icetl's rename detection in Phase 5.
+>
+> **As built, Phase 5 (2026-11-18):** confirmed. Every final task runs one
+> `COPY (...) TO '<table>/data/icefleet/<query>/stage-<k>/task-<i>' (FORMAT parquet,
+> FIELD_IDS {...}, PARTITION_BY (...) | FILE_SIZE_BYTES n, RETURN_STATS true)`; the
+> coordinator commits the files with PyIceberg's `add_files`, which reads each footer for
+> the statistics and the partition value, refuses a type that is not the table's and a
+> file already in it, and is checked by icetl reading the table back (renames included).
+> The field ids come from the **created** table's schema: PyIceberg renumbers nested
+> fields at `create_table`. Columns are cast to the table's types after PyIceberg's own
+> `_check_pyarrow_schema_compatible` accepted the frame, so a write is accepted or
+> refused exactly as icetl's append would be. A partitioned table's rows are shuffled by
+> their partition values first (kickoff answer 3), so each value is written by one task:
+> one file per value per write, which also satisfies "one partition value per file".
+> Partitioning by `year / month / day / hour` is distributed too (kickoff answer 2) -- the
+> grouping is the Iceberg ordinal computed in DuckDB (in UTC for a `timestamptz`), and
+> `add_files` computes and checks the real value -- `bucket` and `truncate` stay with
+> icetl's writer. "One snapshot" (step 4) is one **commit**: an append is one snapshot,
+> an overwrite or a dynamic overwrite a delete and an append in one transaction -- the
+> same two snapshots icetl's own overwrite makes (kickoff answer 4).
 
 ### 4.7 Semantics under distribution
 
@@ -485,6 +504,8 @@ Overridden (private, which is why the pin is exact):
 | per-file sizes inside `plan_scan` *(Phase 1)* | not reachable, so `plan/splits.py` lists the scan's files again from the manifests (one extra metadata pass on the coordinator) | `ScanPlan` keeps per-file sizes |
 | `exec.source_sql.build_source`, `DuckDBEngine.register` *(Phase 2)* | stage SQL is no longer icetl's compiled SQL: each stage's own tree is rendered through `substitute_sources` + `build_source` with `CompiledPlan.scans`, exactly as `_compile` renders the whole query | `CompiledPlan` exposes a `render(tree)` |
 | `Session._analyzer.connection` *(Phase 2, wider use)* | `DESCRIBE` types every stage (keys, partials, each aggregate as it is single-node); `duckdb_functions()` lists DuckDB's aggregates, because sqlglot leaves some (`list`) as scalar functions | part of the `Executor` context |
+| `DataFrame.write`, `DataFrameWriter._save` / `_derive` and its settings *(Phase 5)* | the property is wrapped at import (frames of a `ClusterSession` get `ClusterDataFrameWriter`); `_save` is replaced, `_derive` overridden because icetl's hard-codes `DataFrameWriter(...)`; `_merges_schema`, `_dynamic_partitions`, `_apply_partitioning` / `_apply_sort_order` reused | icetl 0.2.0: `Session._writer_class` (already listed above) |
+| PyIceberg's `_check_pyarrow_schema_compatible` *(Phase 5)* | run on the frame's zero-row Arrow schema before writing, so the distributed writer accepts and refuses exactly what icetl's append does | a public schema-compatibility check in PyIceberg, or icetl exposing its own |
 
 Each upstream hook is a small, additive PR to the icetl repo and a version bump of the pin. Until then: `icetl==0.1.0`, and `py_test/test_seams.py` asserts every private attribute icefleet touches still exists with the expected signature, so a pin bump fails loudly rather than mysteriously.
 
@@ -531,8 +552,9 @@ py_src/icefleet/
     runner.py            executes a TaskSpec on icetl's DuckDBEngine
     sinks.py             shuffle / result / iceberg_files writers
   write/
+    target.py            a table as a write target: column types, field ids, partition grouping (Phase 5)
     commit.py            add_files + delete in one transaction, commit_with_retry
-    parquet.py           streaming parquet writer with Iceberg field ids
+    writer.py            ClusterDataFrameWriter: icetl's writer, writing from the workers
 py_test/
   conftest.py            local[N] cluster fixture, SqlCatalog warehouse, oracle session
   fixtures/generator.py  fixture tables (adapted from icetl's)
@@ -776,6 +798,42 @@ a feeling.
 - `ClusterDataFrameWriter`: `saveAsTable` (create on the coordinator, fill distributed), `insertInto`, `mode("append"|"overwrite")`, `partitionOverwriteMode=dynamic`, SQL `INSERT INTO/OVERWRITE`.
 - Non-identity partition specs and `mergeSchema` → icetl's writer (fallback).
 - Tests: written tables read back identical through *icetl* (the independent reader); one snapshot per write; partition paths correct; a concurrent-commit retry; icetl's rename detection still works on files icefleet wrote.
+
+**As built (2026-11-18).** Where the build differs from the list above or adds to it:
+
+- **Kickoff answers (owner, "yes to all"):** (1) `saveAsTable` / `insertInto` in every
+  mode, `partitionOverwriteMode=dynamic`, SQL `INSERT INTO` / `INSERT OVERWRITE` /
+  `CREATE TABLE AS` (all through `df.write`); `mergeSchema` to icetl's writer; `sortBy`
+  records the order, as icetl does; (2) identity and year / month / day / hour
+  partitions distributed, `bucket` / `truncate` to icetl's writer; (3) a partitioned
+  table's rows shuffled by partition value first; (4) one commit per write, retried by
+  icetl's `commit_with_retry`, written files removed if it fails; (5) a failed
+  `saveAsTable` drops the table it created; (6) tests write to temporary warehouses, the
+  dev catalog only under `icefleet_it`; (7) proof of life on a month of trips.
+- **No streaming writer on the coordinator, no `write/parquet.py`:** DuckDB writes the
+  files (§4.6 correction of 2026-11-15, confirmed). The coordinator holds no rows, where
+  icetl's writer materialises the whole result as one Arrow table.
+- **The seam is `DataFrame.write`** (§4.10): `ClusterDataFrameWriter` keeps icetl's rules
+  -- modes, errors, `insertInto` by position, `partitionBy` / `sortBy` / table properties
+  on a created table -- and replaces where the rows go. What it cannot distribute (a
+  query that runs single-node, `mergeSchema`, a `bucket` / `truncate` partition, a
+  `time` / `uuid` / `fixed` / nanosecond column, a dynamic overwrite of a
+  transform-partitioned table) it hands to icetl's writer unchanged, and
+  `icefleet.fallback=error` refuses instead. A write records its own outcome in
+  `ClusterSession._last_write`: icetl's writer reads its frame with `toArrow()`, which
+  sets `_last_run` to that read.
+- **A created table's schema** comes from a zero-row run of the compiled query on the
+  coordinator's own engine -- the Arrow types icetl's `toArrow()` would have produced,
+  through icetl's `iceberg_ready` -- without running the query.
+- **Empty files** are not committed (a task with no rows reports none).
+- **Proof of life** (`scripts/smoke_write.py`, `icefleet_it` only, `nyc` / `amazon` refused):
+  January 2024 of `nyc.yellow_tripdata`, 2,964,617 rows over 31 days, into a table
+  partitioned by an identity `pickup_date`: append (31 files, 7.6 s cold), append again,
+  overwrite with VendorID 2 only (`delete`, `append`), a dynamic overwrite of three days
+  (3 files); and into one partitioned by `day(tpep_pickup_datetime)` (31 files). After
+  every step the per-day counts and sums read back through icetl equal icetl's over the
+  source, and every write made one file per partition value it wrote. Both tables
+  purged at the end; `nyc.yellow_tripdata`'s metadata untouched.
 
 **Phase 5b — row-level operations.** `DELETE`/`UPDATE`/`MERGE` through icetl's row-level planner with the rows produced distributed and committed via `write/commit.py`.
 

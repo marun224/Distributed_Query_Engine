@@ -19,7 +19,7 @@ __all__ = ["PARTITION_COLUMN", "InputSpec", "OutputFile", "SinkSpec", "TaskResul
 #: `PARTITION_BY` writes one `__part=<p>` directory per value.
 PARTITION_COLUMN = "__part"
 
-SINK_KINDS = ("result", "shuffle")  # "iceberg_files" arrives in Phase 5
+SINK_KINDS = ("result", "shuffle", "iceberg_files")
 
 
 def _require(data: Mapping[str, Any], key: str, kind: type | tuple[type, ...]) -> Any:
@@ -65,6 +65,9 @@ class SinkSpec:
     value; with `partitions == 1` there is no `__part` column and one directory.
     `sample_columns` (a `result` sink feeding a range sort): a reservoir sample of
     `sample_rows` rows of those columns is written beside the rows, as one more file.
+    `iceberg_files`: Iceberg data files, written with `field_ids` (DuckDB's FIELD_IDS
+    literal); with `partition_columns`, one directory per value of those computed
+    columns, which are not written into the files.
     """
 
     kind: str
@@ -73,6 +76,8 @@ class SinkSpec:
     partitions: int = 1
     sample_columns: tuple[str, ...] = ()
     sample_rows: int = 0
+    field_ids: str = ""
+    partition_columns: tuple[str, ...] = ()
 
     def to_json(self) -> dict[str, Any]:
         out: dict[str, Any] = {
@@ -84,6 +89,10 @@ class SinkSpec:
         if self.sample_columns:
             out["sample_columns"] = list(self.sample_columns)
             out["sample_rows"] = self.sample_rows
+        if self.field_ids:
+            out["field_ids"] = self.field_ids
+        if self.partition_columns:
+            out["partition_columns"] = list(self.partition_columns)
         return out
 
     @classmethod
@@ -91,6 +100,10 @@ class SinkSpec:
         kind = _require(data, "kind", str)
         if kind not in SINK_KINDS:
             raise ValueError(f"unknown sink kind {kind!r}")
+        if kind == "iceberg_files" and not data.get("field_ids"):
+            # A data file without field ids reads back by name only, which Iceberg does not
+            # promise (PLAN §4.6): never write one.
+            raise ValueError("an iceberg_files sink needs the table's field ids")
         return cls(
             kind=kind,
             location=_require(data, "location", str),
@@ -98,6 +111,8 @@ class SinkSpec:
             partitions=int(data.get("partitions", 1)),
             sample_columns=tuple(str(c) for c in data.get("sample_columns", ())),
             sample_rows=int(data.get("sample_rows", 0)),
+            field_ids=str(data.get("field_ids", "")),
+            partition_columns=tuple(str(c) for c in data.get("partition_columns", ())),
         )
 
 
