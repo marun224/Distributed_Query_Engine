@@ -29,6 +29,7 @@ from dataclasses import dataclass
 from sqlglot import exp
 
 from icefleet.errors import Uncuttable
+from icefleet.plan.partitioning import partition_expression
 from icefleet.plan.rel import Aggregate, aggregate_calls, from_of
 from icefleet.plan.tasks import PARTITION_COLUMN
 from icefleet.plan.types import cast_to, parquet_safe_type
@@ -39,6 +40,7 @@ __all__ = [
     "AggregateCut",
     "Describe",
     "cut_aggregate",
+    "group_keys",
     "partition_expression",
 ]
 
@@ -78,48 +80,6 @@ class AggregateCut:
     partials: tuple[str, ...] = ()
     finals: tuple[str, ...] = ()
     why_raw: str | None = None
-
-
-#: Keys of these types are hashed as the canonical type, so equal values meet in one
-#: partition whatever their width (§4.1): DuckDB 1.5.6 hashes `-1::INTEGER` and
-#: `-1::BIGINT` differently (positive values happen to agree). UHUGEINT does not fit
-#: HUGEINT and is hashed as it is.
-_HASH_AS = {
-    **dict.fromkeys(
-        (
-            "TINYINT",
-            "SMALLINT",
-            "INTEGER",
-            "BIGINT",
-            "HUGEINT",
-            "UTINYINT",
-            "USMALLINT",
-            "UINTEGER",
-            "UBIGINT",
-        ),
-        "HUGEINT",
-    ),
-    "FLOAT": "DOUBLE",
-}
-
-
-def partition_expression(
-    keys: Sequence[exp.Expression],
-    partitions: int,
-    types: Sequence[str] | None = None,
-) -> exp.Expression:
-    """`hash(k0, k1, ...) % n`, each key cast to its canonical type first.
-
-    `types` are the keys' DuckDB types. `-0.0` and `0.0` hash alike, NULL hashes to one
-    value, and every worker runs the same DuckDB (the handshake enforces it), so equal
-    keys always meet (`py_test/unit/test_partitioning.py`).
-    """
-    hashed_keys = []
-    for index, key in enumerate(keys):
-        canonical = _HASH_AS.get(types[index].upper()) if types is not None else None
-        hashed_keys.append(cast_to(key.copy(), canonical) if canonical else key.copy())
-    hashed = exp.Anonymous(this="hash", expressions=hashed_keys)
-    return exp.Mod(this=hashed, expression=exp.Literal.number(partitions))
 
 
 def _short(expression: exp.Expression) -> str:
@@ -245,7 +205,8 @@ def _stand_ins(
     return written, restore
 
 
-def _keys_of(select: exp.Select) -> list[exp.Expression] | Uncuttable:
+def group_keys(select: exp.Select) -> list[exp.Expression] | Uncuttable:
+    """The grouping keys of `select` (its projection for a SELECT DISTINCT), copied."""
     if select.args.get("distinct"):
         return [projection.unalias().copy() for projection in select.expressions]
     group = select.args.get("group")
@@ -274,7 +235,7 @@ def cut_aggregate(
     relation = from_of(select)
     if relation is None:  # pragma: no cover - rel.from_sqlglot only admits a FROM
         return Uncuttable("an aggregate without a FROM")
-    keys = _keys_of(select)
+    keys = group_keys(select)
     if isinstance(keys, Uncuttable):
         return keys
     n = partitions if keys else 1

@@ -1,6 +1,6 @@
 # icefleet — a distributed SQL and DataFrame engine over Apache Iceberg, executed by a fleet of DuckDB workers
 
-**Status:** Draft v1.4 — 2026-11-16, decisions locked (§2); v1.1 adds decision 26 (HTTP control plane) and decision 27 (Kubernetes + Argo Workflows as the deployment target); v1.2 adds decision 28 (development in a Linux dev container); v1.3 records Phase 1 as built (§6), corrects §4.6 (DuckDB writes field ids) and extends the seam table (§4.10); v1.4 records Phase 2 as built (§6), corrects §4.1 (DuckDB hashes integers by width) and §4.4 (shuffle files are not rolled), extends §4.10 and §5
+**Status:** Draft v1.5 — 2026-11-18, decisions locked (§2); v1.1 adds decision 26 (HTTP control plane) and decision 27 (Kubernetes + Argo Workflows as the deployment target); v1.2 adds decision 28 (development in a Linux dev container); v1.3 records Phase 1 as built (§6), corrects §4.6 (DuckDB writes field ids) and extends the seam table (§4.10); v1.4 records Phase 2 as built (§6), corrects §4.1 (DuckDB hashes integers by width) and §4.4 (shuffle files are not rolled), extends §4.10 and §5; v1.5 records Phase 3 as built (§6), corrects §4.3 (join strategy chosen when planning, from upper bounds) and §4.4 (broadcast), updates §5
 **Owner:** Arun
 **Base:** [`icetl`](https://github.com/marun224/data_transformation_engine) 0.1.0 — single-node, sqlglot IR, PyIceberg planning, DuckDB execution. Local checkout: `E:\workspace\Transformation_Engine_08172026`.
 **State of the work:** [task_tracker.md](task_tracker.md). This file is the design; it does not say what is done.
@@ -311,6 +311,16 @@ handshake refuses a mismatch) because `hash()` stability across versions is not 
 > `py_test/unit/test_partitioning.py` pins both the fact and the fix. Within one aggregate
 > every key has a single type, so Phase 2 needs it only for consistency; Phase 3's joins
 > need it for correctness. `DECIMAL` keys of different scales are still Phase 3's to align.
+>
+> **As built, Phase 3 (2026-11-18, kickoff answer 5):** `plan/partitioning.py`
+> `join_hash_type(l, r)` picks the type both sides of a join key are hashed as: one type
+> on both sides is hashed as an aggregate key would be (so an aggregate's output and a
+> join side can be co-partitioned); integers of different widths as `HUGEINT`; any
+> `FLOAT`/`DOUBLE` among numbers as `DOUBLE`; integers and `DECIMAL`s as
+> `DECIMAL(38, the larger scale)` when every value fits; anything else (`VARCHAR =
+> INTEGER`, `DATE = TIMESTAMP`) does not hash alike, so that join broadcasts or runs
+> single-node. A hypothesis test checks that values DuckDB calls equal land in one
+> partition for every mixed pair.
 
 ### 4.2 Two-phase aggregation
 
@@ -345,6 +355,24 @@ final. icetl's manifest-only `count(*)` shortcut still fires before any of this.
 
 No cost-based join reordering (decision 6). sqlglot's `optimize_joins` already runs in icetl.
 
+> **Correction, 2026-11-18 (Phase 3, kickoff answer 2):** the strategy is chosen *when
+> planning*, so `explain()` is exact before anything runs. A side's size is an upper
+> bound: a scan is `ScanPlan.bytes_scanned` (parquet bytes of the selected columns), an
+> aggregate at most its input's size (a global aggregate 0), and a join's output is never
+> broadcast. "From the measured shuffle manifest for a derived side" above is Phase 7's.
+> The bound is loose in one common case: icetl plans **one** `ScanPlan` for every
+> reference to a table, pruned by the union of their filters, so both sides of a
+> self-join -- including an aggregate of the same table -- are bounded by that whole scan
+> (the proof of life: a 265-row zone aggregate bounded at 330 MB). Of an inner (or cross)
+> join both sides may be broadcast; the smaller is, the right on a tie. Equality keys
+> include `IS NOT DISTINCT FROM`; every other conjunct of the ON stays in it and runs per
+> partition. A conjunct of the WHERE that reads one relation runs below the join too when
+> no outer join can NULL that relation, and so does an ON conjunct reading only the
+> joined relation of an inner, left, semi or anti join (a copy: the original stays). A
+> side already hash-partitioned by its keys with the same count and hash types is not
+> reshuffled, and an aggregate over rows already partitioned by a subset of its keys runs
+> in place, whole, with no partial and no shuffle (kickoff answer 4).
+
 ### 4.4 The exchange
 
 ```
@@ -369,6 +397,14 @@ No cost-based join reordering (decision 6). sqlglot's `optimize_joins` already r
 > a typed empty relation (`SELECT CAST(NULL AS t) AS c, ... WHERE FALSE`) rendered into
 > its SQL, so the result keeps its schema and a global aggregate its one row. The
 > reserved `InputSpec.schema_ipc` is not needed for that.
+>
+> **As built, Phase 3 (2026-11-18):** a broadcast is a stage with the `result` sink
+> (`.../stage-<k>/task-<i>/data_<n>.parquet`, one typed file even when empty), and every
+> task of the stage reading it binds *all* its files (`StageInput.mode = "all"`); a
+> shuffle input binds the task's partition (`"partition"`). A stage reads each input under
+> its own placeholder `__icefleet_input_<k>__` and parameter `$icefleet_input_<k>`. A
+> partition-driven stage gets a task per partition any of its partitioned inputs has
+> rows in; an input with no rows there is read as its typed empty relation.
 
 ### 4.5 Splits
 
@@ -454,19 +490,21 @@ py_src/icefleet/
   errors.py              Uncuttable, ClusterError, WorkerError
   _versions.py           the handshake's versions and protocol number
   plan/
-    rel.py               RelNode types (Scan, Project, Aggregate) and Query; from_sqlglot
-    partitioning.py      Hash / Single / Broadcast / Range, requirement rules (Phase 3+;
-                         Phase 2's hash partitioner lives in aggregates.py)
-    stages.py            StagePlan, ScanStage, ShuffleStage, plan_stages()
-    aggregates.py        decomposition table (§4.2), the partial/final rewrite, partition_expression
+    rel.py               RelNode types (Scan, Project, Aggregate, Join) and Query; from_sqlglot,
+                         IN (subquery) -> SEMI JOIN, an aggregating join split in two
+    partitioning.py      Hash, partition_expression, the type a key is hashed as (Phase 3;
+                         Range is Phase 4's)
+    stages.py            Stage, StageInput, StagePlan, the pipeline planner, plan_stages()
+    aggregates.py        decomposition table (§4.2), the partial/final rewrite
     types.py             parquet-unsafe types and their lossless stand-ins (Phase 2)
-    joins.py             strategy choice (§4.3)
+    joins.py             equality keys, which side may be broadcast, NULL-supplied relations (§4.3)
     splits.py            bin-packing (§4.5)
     tasks.py             TaskSpec / TaskResult (de)serialisation
     describe.py          the explain() renderer
   scheduler/
     base.py              Scheduler protocol: run(StagePlan) -> manifests; shared stage ordering
-    threadpool.py        ThreadPoolScheduler: tasks to the slots of running workers over HTTP
+    threadpool.py        ThreadPoolScheduler: tasks to the slots of running workers over HTTP,
+                         every stage whose inputs are done in one wave (Phase 3)
     argo.py              ArgoScheduler (Phase 6b): one Workflow per query, a pod per task
   exchange/
     base.py              Exchange protocol: locate, read_source(), list, delete
@@ -621,6 +659,49 @@ a feeling.
 - Tests against the oracle: inner/left/right/full/semi/anti, small×large (broadcast), large×large (shuffle), three-way, join keys of differing integer widths, string keys, NULL keys, a join after an aggregate (derived side sized from the measured manifest), non-equi join → fallback.
 
 **Done when:** the join suite passes; `explain()` names the strategy per join; tracker updated.
+
+**As built (2026-11-18).** Where the build differs from the list above or adds to it:
+
+- **Kickoff answers (owner, "yes to all"):** (1) equi-joins of every kind over two or more
+  tables with Phase 2's shapes above and below, residual ON conditions per partition,
+  cross / non-equi only by broadcast, and an uncorrelated `x IN (SELECT ...)` WHERE
+  conjunct as a `SEMI JOIN` (`NOT IN`, `EXISTS`, correlated stay single-node); (2) the
+  strategy chosen when planning, from upper bounds (§4.3 correction); (3) the broadcast
+  side written once, read whole by every task (§4.4); (4) co-partition reuse for joins
+  and for an aggregate on the join key; (5) key type alignment (§4.1); (6) independent
+  stages run in one wave; (7) proof of life: a join of the table to an aggregate of
+  itself, broadcast and shuffled.
+- **The planner is a tree now, not Phase 2's chain.** `plan/rel.py` adds `Join` (a SELECT
+  over two or more relations, one child per relation) and splits an aggregating join
+  SELECT into an `Aggregate` over a `Join` subquery `__icefleet_j`. `plan/stages.py`
+  plans bottom up with *open pipelines* -- SQL a task could run, what drives its tasks
+  (a scan's splits, a shuffle's partitions, or a single task), what it reads, what it is
+  partitioned by and how big it can be -- closed into a stage at a shuffle, a broadcast
+  or the result. One `Stage` type replaces `ScanStage` / `ShuffleStage`. Phase 2's
+  plans come out stage for stage as before.
+- **Every table reference is its own pipeline.** icetl gives a self-join one `ScanPlan`
+  and one `$<view>_paths_0` parameter for both references; each reference is planned and
+  rendered in its own stage, so no stage binds two file lists to one parameter.
+- **A join's columns travel under unique names.** Each side projects exactly the columns
+  the join reads or returns, named after the column where that is unambiguous
+  (`<alias>_<name>` otherwise); ON, WHERE and the projection are rewritten onto them.
+- **The scheduler runs waves** (kickoff answer 6): every stage whose inputs are done, all
+  its tasks sharing the slots. The result is sorted by (stage, task).
+- **Found and fixed, a Phase 1 race:** the worker released a task's slot only *after*
+  sending its answer, so a coordinator that handed the slot its next task at once could
+  be refused "all slots are busy". Phase 3's waves of short tasks hit it once in the
+  gate. The slot is now released before the answer goes out
+  (`test_worker_server.py::test_the_slot_is_free_when_the_answer_arrives`, which fails
+  against the old server).
+- **Config:** `icefleet.broadcast.thresholdBytes` (64 MiB; `0` never broadcasts).
+- **Proof of life:** `smoke_cluster.py` on `nyc.yellow_tripdata`: long trips (13 of 62
+  files) joined to the average fare per pickup zone in January 2024, both scans 14 of 62
+  files. Broadcast (threshold raised to 1 GiB, §4.3 correction): 3 stages -- partial,
+  final -> broadcast, the trip scan joining it -- 6,485 rows equal to icetl. Shuffled
+  (threshold 0): 3 stages -- partial, the trips shuffled by zone, and the join *inside*
+  the zone aggregate's final stage, already partitioned by zone -- 6,485 rows equal to
+  icetl. Prefix removed both times. 2.2 s and 4.4 s cold, icetl 0.7 s (one run each, not
+  a benchmark).
 
 ### Phase 4 — Windows, ordering, set operations, grouping sets
 

@@ -22,3 +22,13 @@ Not divergences, by construction:
   *fails* with DuckDB's conversion error rather than returning a different number (P3:
   degrade, never fail wrong).
 - **NULL group keys** form one group, as single-node: `hash(NULL)` is one value.
+- **NULL join keys** (Phase 3) never match under `=` and always match under
+  `IS NOT DISTINCT FROM`, as single-node; a row an outer join keeps for a NULL key is
+  emitted once, by the one task its partition went to. Only a side whose unmatched rows
+  are dropped is ever broadcast, so no unmatched row is emitted once per task.
+- **Join keys of different types** (Phase 3) are hashed as one type both sides convert to
+  exactly (or, for `DOUBLE`, as DuckDB's own comparison converts them), so keys that
+  compare equal always meet; keys with no such type are not shuffled at all.
+- **`x IN (SELECT y ...)`** (Phase 3) runs as a semi join on `x = y`. In a WHERE, NULL and
+  false both drop the row, so the two agree on every input, NULLs included
+  (`test_rel.py::test_the_semi_join_returns_what_in_returns_nulls_included`).

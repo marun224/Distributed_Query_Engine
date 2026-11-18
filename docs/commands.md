@@ -344,3 +344,77 @@ grep -E "KEY|SECRET|PASSWORD|TOKEN" .env | ... git grep -lIF --untracked   # rea
 git add -A
 git commit -F -                                        # "Phase 2: exchange (shuffle) and two-phase aggregation"
 ```
+
+## 2026-11-17 — project analysis (read-only; nothing changed but this log)
+
+```bash
+git ls-files; git ls-files | xargs wc -l; git log --stat     # 73 tracked files; 3 commits (Phase 0, 1, 2)
+grep ... py_src py_test; grep ... <icetl checkout>/src/icetl  # discovery, engine.cursor, Session._execute, test coverage
+git status -sb; git reflog show origin/main -3                # main == origin/main at 88fc616, "update by push"
+```
+
+## 2026-11-18 — resume: read tracker, plan, workflow, commands (read-only)
+
+```bash
+wc -l docs/*.md CLAUDE.md; ls -R py_src py_test scripts deploy; git diff --stat   # orientation
+git diff docs/commands.md; tail -40 docs/commands.md; cat docs/divergence.md
+git status -sb; git log --oneline -3 origin/main                                    # main == origin/main at 88fc616
+git ls-files py_src py_test scripts | xargs wc -l | sort -n | tail -30              # ~6,650 lines
+```
+
+## 2026-11-18 — owner: "can you push phase 2" (already pushed; nothing sent)
+
+```bash
+git ls-remote origin refs/heads/main; git rev-parse HEAD; git status -sb   # all 88fc616: Phase 2 already on GitHub
+```
+
+## 2026-11-18 — Phase 2 confirmed ("pls start pahse 3"); Phase 3 kickoff and spike (read-only)
+
+```powershell
+# read the planner, scheduler, wire format, sinks, session, runner, fixtures; icetl's CompiledPlan / join() / ScanPlan
+.\scripts\dev.ps1 up                                       # icefleet-dev was not running; image cached, started
+# Spike: icetl's optimized tree for 18 join shapes over the offline fixtures (warehouse in /tmp/p3_spike)
+docker cp <scratchpad>\p3_spike.py icefleet-dev:/tmp/p3_spike.py
+.\scripts\dev.ps1 uv run python /tmp/p3_spike.py > <scratchpad>\p3_spike.out   # 17 of 18 compiled; DF full join with a Column condition is icetl's own AnalysisException (ambiguous id)
+curl -s http://localhost:8182/v1/namespaces[/<ns>/tables]  # nyc: only yellow_tripdata; temporal_poc: 4 tables; no amazon
+# tracker: Phase 2 confirmed, Phase 3 checklist (3.0 asked, 3.1 spike done)
+```
+
+## 2026-11-18 — Phase 3 build (owner: "yes to all" to the 7 kickoff questions)
+
+```powershell
+# Source edits with the Edit/Write tools and small Python text scripts (utf-8, LF).
+# New: plan/partitioning.py, plan/joins.py; rewritten: plan/rel.py, plan/stages.py;
+# changed: aggregates.py (hash helpers moved out), describe.py, config.py, scheduler, worker/server.py
+.\scripts\dev.ps1 uv run python -m ruff format py_src; ... ruff check py_src --output-format concise; ... mypy   # iterated
+.\scripts\dev.ps1 uv run python -m pytest -q -x -p no:randomly py_test/unit py_test/test_seams.py   # 190 passed
+.\scripts\dev.ps1 uv run python -m pytest -q -p no:randomly py_test/cluster
+#   6 failed: Phase 1/2 tests that used a join as the "runs single-node" example -> moved to a window
+.\scripts\dev.ps1 uv run python -m pytest -q -p no:randomly py_test/cluster/test_joins.py -x
+#   DataFrame join + filter + agg on `amount_1` ran single-node: icetl's optimizer left it unoptimized (USING)
+docker cp <scratchpad>\p3_using.py icefleet-dev:/tmp/; .\scripts\dev.ps1 uv run python /tmp/p3_using.py   # confirmed; test uses `amount`
+.\scripts\dev.ps1 uv run python -m pytest -q -p no:randomly py_test/cluster/test_joins.py   # 140 passed (2 explain-text fixes after)
+.\scripts\dev.ps1 uv run tox                                  # 507 passed, 6 skipped -> skips replaced by a `shuffled` fixture
+.\scripts\dev.ps1 uv run python scripts/smoke_cluster.py
+#   projection OK, aggregate OK, join-shuffle OK (6485 rows, 3 stages, zone side reused);
+#   join-broadcast did not broadcast: self-join scans share one ScanPlan (330.6 MB bound) -> threshold 1GiB for it
+.\scripts\dev.ps1 uv run python scripts/smoke_cluster.py --only join-broadcast   # (before the script edit applied) FAIL
+.\scripts\dev.ps1 uv run python scripts/smoke_cluster.py      # all four OK: 6485 rows = icetl both join ways, prefixes removed
+.\scripts\dev.ps1 uv run tox
+#   1 failed: "all 2 slots are busy" -- the worker released its slot after sending the answer (Phase 1 race)
+#   fixed in worker/server.py; regression test checked against the old server (git show HEAD:... swapped in, FAILED, restored)
+.\scripts\dev.ps1 uv run python -m pytest -q -p no:randomly py_test/unit/test_worker_server.py -k slot_is_free
+.\scripts\dev.ps1 uv run tox                                  # lint/type/py312 (508 passed)/dist OK, 102.9 s -- Phase 3 gate green
+.\scripts\dev.ps1 uv run python -m pytest -q py_test/cluster  # x2, random order: 264 passed each
+# docs: plan v1.5, task_tracker (Phase 3 built), divergence.md, README
+```
+
+## 2026-11-18 — commit Phase 3 (owner: "pls commit pahse 3 changes. and start pahse 4 after that"; not pushed)
+
+```bash
+# tracker: Phase 3 confirmed, Phase 4 kickoff next
+git check-ignore -q .env                                   # .env ignored
+grep -E "KEY|SECRET|PASSWORD|TOKEN" .env | ... git grep -lIF --untracked   # real .env values in 0 files
+git add -A
+git commit -F -                                            # "Phase 3: joins -- broadcast and shuffle hash"
+```

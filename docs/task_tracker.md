@@ -8,13 +8,13 @@ Update at the end of every session. Design lives in
 
 | | |
 |---|---|
-| Last updated | 2026-11-16 |
-| Current phase | **Phase 2 — Exchange (shuffle) and two-phase aggregation: built, gate green, awaiting owner confirmation** |
-| Last updated (git) | 2026-11-16: Phase 1 committed (`fb937a7`) and pushed to the new **public** repo https://github.com/marun224/Distributed_Query_Engine (`origin`, `main` tracks `origin/main`). **Phase 2 committed on `main`** at the owner's request ("pls commit phase 2", 2026-11-16; the commit after `fb937a7`, see `git log`). **Not pushed** |
-| Next action | **Owner to confirm Phase 2** and say whether to push it; then the Phase 3 kickoff questions |
-| Next phase | Phase 3 — Joins: broadcast and shuffle hash |
+| Last updated | 2026-11-18 |
+| Current phase | **Phase 4 — Windows, ordering, set operations, grouping sets: kickoff** (Phase 3 confirmed 2026-11-18) |
+| Last updated (git) | 2026-11-16: Phase 1 committed (`fb937a7`) and pushed to the new **public** repo https://github.com/marun224/Distributed_Query_Engine (`origin`, `main` tracks `origin/main`). **Phase 2 committed on `main`** at the owner's request ("pls commit phase 2", 2026-11-16; `88fc616`). **Pushed:** checked 2026-11-18 with `git ls-remote`, GitHub's `main` is `88fc616`. **Phase 3 committed on `main`** at the owner's request ("pls commit pahse 3 changes", 2026-11-18; the commit after `88fc616`, see `git log`). **Not pushed** |
+| Next action | **Phase 4 kickoff questions** to the owner; then plan and build |
+| Next phase | Phase 5 — Distributed writes, one commit |
 | Blocked on | Owner confirmation only |
-| Gate | **`.\scripts\dev.ps1 uv run tox` green on 2026-11-16** (Phase 2): lint · type · py312 **320 passed** · dist, 82 s. Proof of life `scripts/smoke_cluster.py` on the dev catalog: **OK** for both queries (projection, and the two-stage aggregate). The Windows `.venv` gate is not authoritative (decision 28) |
+| Gate | **`.\scripts\dev.ps1 uv run tox` green on 2026-11-18** (Phase 3): lint · type · py312 **508 passed** · dist, 103 s; the cluster suite then twice more in random order, 264 passed each. Proof of life `scripts/smoke_cluster.py` on the dev catalog: **OK** for all four queries (projection, aggregate, join broadcast, join shuffled). The Windows `.venv` gate is not authoritative (decision 28) |
 
 ## Phases
 
@@ -22,9 +22,9 @@ Update at the end of every session. Design lives in
 |---|---|---|---|---|
 | 0 | Scaffold: venv, uv, pyproject, tox gate, docs, smoke tests | **done** | 2026-11-15 | **yes, 2026-11-15** |
 | 1 | Worker (HTTP), `local[N]`, splits, scan-only stages, fallback, proof of life on the dev catalog | **done** | 2026-11-15 | **yes, 2026-11-16** |
-| 2 | Exchange (shuffle) + two-phase aggregation + explain DAG | **built — awaiting confirmation** | 2026-11-16 | pending |
-| 3 | Joins: broadcast and shuffle hash | not started | — | — |
-| 4 | Windows, distributed ORDER BY (range partitioning), OFFSET, set operations, grouping sets | not started | — | — |
+| 2 | Exchange (shuffle) + two-phase aggregation + explain DAG | **done** | 2026-11-16 | **yes, 2026-11-18** |
+| 3 | Joins: broadcast and shuffle hash | **done** | 2026-11-18 | **yes, 2026-11-18** |
+| 4 | Windows, distributed ORDER BY (range partitioning), OFFSET, set operations, grouping sets | **in progress — kickoff** | — | — |
 | 5 | Distributed writes, one commit; 5b row-level operations | not started | — | — |
 | 6 | Container image, Kubernetes manifests, Argo fleet-per-workflow, integration tier, benchmarks (decision 27) | not started | — | — |
 | 6b | Argo as a scheduler backend: pod per task (`ArgoScheduler`, `icefleet-worker run-task`) | not started | — | — |
@@ -81,7 +81,25 @@ Update at the end of every session. Design lives in
 | 2.9 | Tests: aggregation suite on `local[2]`/`local[3]` (partial, raw, ordered, NULL keys, empty groups, streaming, empty-partition skipping); rewrite checked in plain DuckDB through the real sink; INTEGER/BIGINT co-partition + hypothesis property; stand-in round trips; shuffle sink; exchange layout §4.4; float tolerance in the oracle | **done** | 320 tests (+142), offline suite ~60 s |
 | 2.10 | `scripts/smoke_cluster.py` headline aggregate on `nyc.yellow_tripdata` | **done** | 39 of 62 files, 4 splits, 64-way shuffle via MinIO (4 partitions with rows), 4 rows equal to icetl, prefix removed; 1.2 s cold, 1.0 s warm, icetl 0.6 s (one run, not a benchmark) |
 | 2.11 | Docs: plan v1.4 (§4.1, §4.4 corrections, §4.10, §5, §6 "As built"), `docs/divergence.md` (new), README | **done** | |
-| 2.12 | Owner confirms Phase 2 | **pending** | |
+| 2.12 | Owner confirms Phase 2 | **done** | 2026-11-18, "pls start pahse 3" (after the done-when checklist was shown); Phase 2 was already on GitHub (`88fc616`) |
+
+## Phase 3 checklist
+
+| # | Task | Status | Notes |
+|---|---|---|---|
+| 3.0 | Kickoff questions (7) answered | **done** | owner: "yes to all" (2026-11-18): (1) every equi-join kind, cross / non-equi by broadcast only, `IN (subquery)` as a semi join; (2) strategy chosen when planning, from upper bounds; (3) broadcast side written once, read whole; (4) co-partition reuse, joins and aggregates; (5) key type alignment; (6) independent stages in one wave; (7) proof of life broadcast + shuffled. Recorded in plan §6 Phase 3 "As built" |
+| 3.1 | Spike: icetl's optimized trees for 18 join shapes (fixtures, read-only) | **done** | a join stays one flat `SELECT` with `joins` (an aggregate over a join is the same SELECT with `GROUP BY`); semi/anti arrive as DuckDB `SEMI` / `ANTI JOIN`; the DataFrame `on="id"` form projects `COALESCE(l.id, r.id)`; **a self-join has one `ScanPlan` and both references share one `$<view>_paths_0` parameter**, so each table *reference* must become its own stage input; `x IN (SELECT ...)` is left as a subquery (not unnested); `ScanPlan.bytes_scanned` is parquet bytes of the selected columns. The dev catalog now holds only `nyc.yellow_tripdata` (`yellow_tripdata_wide`, plan §3.4, is gone) |
+| 3.2 | `plan/partitioning.py`: `Hash`, `partition_expression` (moved from `aggregates.py`, re-exported), `hash_type`, `join_hash_type` | **done** | plan §4.1 "As built, Phase 3" |
+| 3.3 | `plan/rel.py`: a tree with `Join`; `IN (subquery)` -> `SEMI JOIN`; an aggregating join split into `Aggregate` over `Join`; join kinds; refusals (ASOF, USING left over, `*`, correlated / `NOT IN` / `EXISTS`) | **done** | Phase 2's chain tests unchanged and green |
+| 3.4 | `plan/joins.py`: equality keys (incl. `IS NOT DISTINCT FROM`), `BROADCASTABLE`, NULL-supplied relations, filter push-down rules | **done** | plan §4.3 correction |
+| 3.5 | `plan/stages.py`: pipeline planner; one `Stage` type with `StageInput`s (`partition` / `all`); broadcast; shuffle with co-partition reuse; aggregate in place; per-reference scans | **done** | `ScanStage` / `ShuffleStage` gone; `describe.py` renders any stage, `reads stage k (broadcast)` |
+| 3.6 | Scheduler waves (`ThreadPoolScheduler.run`) | **done** | `py_test/unit/test_scheduler.py` |
+| 3.7 | `icefleet.broadcast.thresholdBytes` (64 MiB, 0 = never) | **done** | `config.py` |
+| 3.8 | **Phase 1 race found and fixed:** the worker released its slot after sending the answer; a slot handed its next task at once could be refused "all slots are busy" (seen once in the gate) | **done** | `worker/server.py` releases first; regression test fails against the old server |
+| 3.9 | Tests: join suite `py_test/cluster/test_joins.py` (27 joins x broadcast / shuffled x `local[2]` / `local[3]`, plus broadcast-only, ordered, strategy and reuse checks); unit tests for keys, kinds, `IN` rewrite (NULL semantics checked in DuckDB), hash types (+ hypothesis), scheduler waves; Phase 1/2 tests that used a join as "single-node" moved to a window | **done** | 508 tests (+188) |
+| 3.10 | `scripts/smoke_cluster.py`: `join-broadcast`, `join-shuffle` on `nyc.yellow_tripdata` | **done** | 6,485 rows equal to icetl both ways, 3 stages each, prefix removed; broadcast needs the threshold at 1 GiB (see Known gaps) |
+| 3.11 | Docs: plan v1.5 (§4.1, §4.3, §4.4, §5, §6 "As built"), `divergence.md`, README | **done** | |
+| 3.12 | Owner confirms Phase 3 | **done** | 2026-11-18, "pls commit pahse 3 changes. and start pahse 4 after that" |
 
 ## Open decisions
 
@@ -141,13 +159,28 @@ No known wrong answers. Limits by design and environment issues:
   `powershell -ExecutionPolicy Bypass -File .\scripts\dev.ps1 ...`; changing the policy is
   the owner's call.
 
-- **Phase 2 limits, by design (plan §6 Phase 2 "As built"):** one table per query; joins
-  (Phase 3), windows, OFFSET, ORDER BY / LIMIT inside a subquery, grouping sets and an
-  aggregate over an aggregate (Phase 4) run single-node. ORDER BY of a *large* result is
+- **Phase 3 limits, by design (plan §6 Phase 3 "As built"):** windows, OFFSET, ORDER BY /
+  LIMIT inside a subquery, set operations, grouping sets and an aggregate directly over an
+  aggregate (Phase 4) run single-node; so do a non-equi / cross join with no side under
+  the broadcast threshold, a full join without an equality, join keys of types that do
+  not hash alike (`VARCHAR = INTEGER`, `DATE = TIMESTAMP`), ASOF / POSITIONAL joins,
+  `NOT IN`, `EXISTS` and correlated subqueries. ORDER BY of a *large* result is
   sorted on the coordinator (bounded by `icefleet.result.maxBytes`); the range-partitioned
   sort is Phase 4. Still single-node from Phase 1: ENUM / BIT / VARINT / UNION result or
   shuffled types, scans pruned to no files, renamed columns across file groups, duplicate
   output names, UDF calls.
+- **Join sizes are upper bounds, and loose for a self-join** (kickoff answer 2): icetl plans one
+  `ScanPlan` per table for all its references, pruned by the union of their filters, so a
+  small aggregate of the same table is bounded by the whole scan and is not broadcast at
+  the default 64 MiB (the proof of life: 265 zones bounded at 330 MB; it raises the
+  threshold to 1 GiB). An aggregate of a *large* input is never broadcast either, however
+  few its groups. The fix is measuring the materialised side at run time (Phase 7).
+- **A shuffle join skews on a hot key** (and all NULL keys of an outer join meet in one
+  partition): every row of a key lands in one task. Skew handling is Phase 7.
+- **icetl's optimizer sometimes does not run** on a DataFrame that refers to a column icetl
+  renamed for a join (`amount_1` after `many.join(plain, "id")`): the "optimized" tree is
+  then the raw one, still `JOIN ... USING`, and icefleet runs it single-node (correctly; it
+  says "a JOIN ... USING the optimizer did not rewrite"). Seen 2026-11-18; icetl's to look at.
 - **Shuffle files are not rolled** (DuckDB cannot combine `FILE_SIZE_BYTES` with
   `PARTITION_BY`): one file per task and partition, which is fine at 64 partitions and
   should be measured in Phase 6.
@@ -173,7 +206,7 @@ No known wrong answers. Limits by design and environment issues:
 | Python | **dev container: 3.12.16** (`python:3.12-slim` pinned by digest), venv `/opt/venv`, uv 0.13.8. Windows (editor only): 3.12.10 via `py -3.12`; no global `uv`, it lives in `.venv\Scripts\uv.exe` |
 | Dev container | `icefleet-dev` (compose project `icefleet-dev`), volumes `icefleet-dev-venv`, `icefleet-dev-cache`; joins `iceberg-nyc_iceberg_net` |
 | Docker | Docker Desktop 29.8.0, Compose v5.5.1 — running. **Its built-in Kubernetes is the dev cluster for Phase 6** (not yet enabled; Argo not yet installed) |
-| REST catalog | `http://localhost:8182` from Windows, `http://iceberg-rest:8181` in the dev container (namespaces `nyc`, `temporal_poc`; table `nyc.yellow_tripdata`). Compose stack `iceberg-nyc` has **no restart policy**: after a Docker Desktop restart, `docker start` postgres, minio, iceberg-rest (and pgadmin) |
+| REST catalog | `http://localhost:8182` from Windows, `http://iceberg-rest:8181` in the dev container (namespaces `nyc`, `temporal_poc`; table `nyc.yellow_tripdata` -- the only one in `nyc` as of 2026-11-18; `yellow_tripdata_wide` is gone). Compose stack `iceberg-nyc` has **no restart policy**: after a Docker Desktop restart, `docker start` postgres, minio, iceberg-rest (and pgadmin) |
 | MinIO | `http://localhost:9100` from Windows, `http://minio:9000` in the dev container; path-style, `us-east-1`; credentials in `.env` |
 | Other clusters | a `kind` cluster `temporal-poc` runs in Docker, publishing 2746 (Argo Server's port). It may be a quicker Phase 6 target than Docker Desktop's Kubernetes; the owner decides at Phase 6 |
 | icetl checkout | `E:\workspace\Transformation_Engine_08172026` (uncommitted docs reorganisation in progress there) |

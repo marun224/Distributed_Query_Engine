@@ -13,7 +13,7 @@ __all__ = ["Scheduler"]
 
 
 class Scheduler(Protocol):
-    """Runs a plan's stages in order, each fully before its dependents (blocking shuffle).
+    """Runs a plan's stages, each only after every stage it reads (blocking shuffle).
 
     Returns every stage's task results, stage by stage, each stage's ordered by task
     index. A failure anywhere fails the whole query (decision 13); task retry is Phase 7.

@@ -135,20 +135,26 @@ class _Handler(BaseHTTPRequestHandler):
                 "Busy",
             )
             return
+        # The slot is released *before* the answer is sent: the coordinator hands the slot
+        # to its next task the moment the answer arrives, and a slot still held then would
+        # refuse that task as busy (a race the many short tasks of Phase 3's waves exposed).
+        failure: tuple[HTTPStatus, str, str] | None = None
         try:
             result = self.server.runner.run(spec)
         except TaskCancelled as exc:
-            self._error(HTTPStatus.CONFLICT, str(exc), "TaskCancelled")
+            failure = (HTTPStatus.CONFLICT, str(exc), "TaskCancelled")
         except TaskFailed as exc:
-            self._error(HTTPStatus.INTERNAL_SERVER_ERROR, str(exc), "TaskFailed")
+            failure = (HTTPStatus.INTERNAL_SERVER_ERROR, str(exc), "TaskFailed")
         except Exception as exc:  # anything else is a worker bug; report it, stay up
             logger.exception("task %s crashed", spec.key)
-            self._error(
+            failure = (
                 HTTPStatus.INTERNAL_SERVER_ERROR,
                 f"{spec.key}: {type(exc).__name__}: {exc}",
                 type(exc).__name__,
             )
-        else:
-            self._reply(HTTPStatus.OK, result.to_json())
         finally:
             self.server.release()
+        if failure is not None:
+            self._error(*failure)
+        else:
+            self._reply(HTTPStatus.OK, result.to_json())

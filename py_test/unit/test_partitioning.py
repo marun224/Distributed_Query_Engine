@@ -1,4 +1,5 @@
-"""The hash partitioner (PLAN §4.1, §4.4): total, consistent, and blind to integer width."""
+"""The hash partitioner (PLAN §4.1, §4.4): total, consistent, and blind to integer width
+-- and, for a join, to the two sides' types."""
 
 from __future__ import annotations
 
@@ -9,6 +10,7 @@ from hypothesis import strategies as st
 from sqlglot import exp
 
 from icefleet.plan.aggregates import partition_expression
+from icefleet.plan.partitioning import join_hash_type
 
 SIGNED = ("TINYINT", "SMALLINT", "INTEGER", "BIGINT", "HUGEINT")
 UNSIGNED = ("UTINYINT", "USMALLINT", "UINTEGER", "UBIGINT")
@@ -94,3 +96,68 @@ def test_every_row_goes_to_exactly_one_partition_and_equal_keys_meet(
         assert 0 <= p < partitions
         by_key.setdefault((a, b), set()).add(int(p))
     assert all(len(ps) == 1 for ps in by_key.values())  # consistent: equal keys, one partition
+
+
+# -- join keys of two types (Phase 3, kickoff answer 5) ------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("left", "right", "expected"),
+    [
+        ("INTEGER", "INTEGER", "HUGEINT"),
+        ("INTEGER", "BIGINT", "HUGEINT"),
+        ("UTINYINT", "SMALLINT", "HUGEINT"),
+        ("VARCHAR", "VARCHAR", "VARCHAR"),
+        ("DECIMAL(10,2)", "DECIMAL(10,2)", "DECIMAL(10,2)"),
+        ("FLOAT", "FLOAT", "DOUBLE"),
+        ("INTEGER", "DOUBLE", "DOUBLE"),
+        ("DECIMAL(10,2)", "FLOAT", "DOUBLE"),
+        ("BIGINT", "DECIMAL(10,2)", "DECIMAL(38,2)"),
+        ("DECIMAL(10,2)", "DECIMAL(18,4)", "DECIMAL(38,4)"),
+        ("HUGEINT", "DECIMAL(10,2)", None),  # 39 digits and 2 decimals do not fit 38
+        ("UHUGEINT", "BIGINT", None),
+        ("VARCHAR", "INTEGER", None),
+        ("DATE", "TIMESTAMP", None),
+    ],
+)
+def test_the_type_two_join_keys_are_hashed_as(left: str, right: str, expected: str | None) -> None:
+    assert join_hash_type(left, right) == expected
+    assert join_hash_type(right, left) == expected
+
+
+def join_partition(con: duckdb.DuckDBPyConnection, value: str, kind: str, hashed: str) -> int:
+    expression = partition_expression(
+        [exp.maybe_parse(f"CAST({value} AS {kind})", dialect="duckdb")], 64, hash_as=[hashed]
+    )
+    row = con.execute(f"SELECT {expression.sql(dialect='duckdb')}").fetchone()
+    assert row is not None
+    return int(row[0])
+
+
+MIXED = [
+    ("INTEGER", "BIGINT"),
+    ("SMALLINT", "HUGEINT"),
+    ("INTEGER", "DOUBLE"),
+    ("BIGINT", "DECIMAL(12,2)"),
+    ("DECIMAL(10,2)", "DECIMAL(18,4)"),
+    ("DECIMAL(9,3)", "DOUBLE"),
+]
+
+
+@settings(max_examples=60, deadline=None)
+@given(value=st.integers(-30000, 30000), pair=st.sampled_from(MIXED))
+def test_join_keys_that_compare_equal_meet_in_one_partition(
+    value: int, pair: tuple[str, str]
+) -> None:
+    """Whatever DuckDB's comparison casts to, two values it calls equal hash alike."""
+    con = duckdb.connect()
+    left, right = pair
+    hashed = join_hash_type(left, right)
+    assert hashed is not None
+    literal = f"({value})" if "DECIMAL" not in left + right else f"({value} / 4)"
+    equal = con.execute(f"SELECT CAST({literal} AS {left}) = CAST({literal} AS {right})").fetchone()
+    assert equal is not None
+    if equal[0]:
+        assert join_partition(con, literal, left, hashed) == join_partition(
+            con, literal, right, hashed
+        )

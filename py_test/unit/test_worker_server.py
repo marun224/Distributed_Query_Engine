@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import threading
+import time
 import urllib.error
 import urllib.request
 from collections.abc import Iterator
@@ -210,3 +211,25 @@ def test_a_single_partition_shuffle_is_partition_zero(
     assert status == 200, body
     manifest = TaskResult.from_json(body).manifest
     assert len(manifest) == 1 and manifest[0].partition == 0 and manifest[0].rows == 1
+
+
+def test_the_slot_is_free_when_the_answer_arrives(
+    worker: WorkerServer, data_file: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The scheduler sends a slot its next task the moment the last answer arrives, so the
+    slot must already be free then. Releasing it is made slow here, as a descheduled
+    thread under load would make it: were it released after the answer is sent, the
+    second task would be refused as busy (found by Phase 3's waves of short tasks)."""
+    release = worker.release
+
+    def slow_release() -> None:
+        time.sleep(0.3)
+        release()
+
+    monkeypatch.setattr(worker, "release", slow_release)
+    for index in range(2):
+        spec = task(
+            "SELECT * FROM read_parquet($p) WHERE id < 3", (data_file,), tmp_path / f"t{index}"
+        )
+        status, body = call(worker, "POST", "/tasks", spec.to_json())
+        assert status == 200, body

@@ -1,6 +1,7 @@
 """The oracle suite: every query on `local[2]` and `local[3]` equals icetl's answer.
 
-Scans, filters and projections here; aggregation has its own suite (`test_aggregates.py`).
+Scans, filters and projections here; aggregation (`test_aggregates.py`) and joins
+(`test_joins.py`) have their own suites.
 
 Each case also asserts *how* it ran. A plan that quietly stopped distributing would still
 return the right rows, so the mode is part of what is tested.
@@ -78,9 +79,13 @@ SINGLE_NODE: dict[str, tuple[Query, str]] = {
         "Phase 4",
     ),
     "offset": (lambda s: s.sql("SELECT id FROM fx.many ORDER BY id LIMIT 5 OFFSET 3"), "Phase 4"),
-    "join": (
-        lambda s: s.table("fx.plain").join(s.table("fx.plain").select("id"), "id"),
-        "Phase 3",
+    # A full join may broadcast neither side, and without an equality there is no key
+    # to shuffle by (joins have their own suite, test_joins.py).
+    "full join without an equality": (
+        lambda s: s.sql(
+            "SELECT a.id, b.id AS bid FROM fx.plain a FULL JOIN fx.plain b ON a.id < b.id"
+        ),
+        "without an equality condition",
     ),
     "renamed columns": (lambda s: s.table("fx.renamed"), "Phase 7"),
     "no data files": (lambda s: s.table("fx.empty"), "no data files"),

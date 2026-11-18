@@ -1,16 +1,27 @@
-"""Proof of life against the dev catalog (PLAN Phases 1 and 2, §3.4).
+"""Proof of life against the dev catalog (PLAN Phases 1, 2 and 3, §3.4).
 
-`local[2]` workers, the exchange in MinIO, two queries over `nyc.yellow_tripdata` (41M
-rows, 62 files), each compared with icetl's own answer:
+`local[2]` workers, the exchange in MinIO, queries over `nyc.yellow_tripdata` (41M rows,
+62 files), each compared with icetl's own answer:
 
-    projection  a filtered projection: one stage (Phase 1)
-    aggregate   the headline query -- revenue, trips and mean distance per VendorID --
-                as two stages: partial aggregates, a hash shuffle through MinIO, final
-                aggregates per partition (Phase 2)
+    projection      a filtered projection: one stage (Phase 1)
+    aggregate       the headline query -- revenue, trips and mean distance per VendorID --
+                    as two stages: partial aggregates, a hash shuffle through MinIO, final
+                    aggregates per partition (Phase 2)
+    join-broadcast  long trips joined to their pickup zone's average fare in January
+                    2024 (an aggregate of the same table): the zones are aggregated, then
+                    broadcast to every task scanning the trips (Phase 3). The threshold is
+                    raised to 1 GiB for it: icetl plans one scan for both references to
+                    the table, pruned by the union of their filters, so the zone side's
+                    size bound is that whole scan (~330 MB), not the ~265 rows it
+                    aggregates to (kickoff answer 2: sizes are bounded when planning;
+                    measuring them is Phase 7's)
+    join-shuffle    the same join with icefleet.broadcast.thresholdBytes=0: the trips are
+                    shuffled by zone, and the join runs in the zone aggregate's own final
+                    stage, which is already partitioned by zone (Phase 3)
 
 and each query's exchange prefix checked gone afterwards.
 
-    .\\scripts\\dev.ps1 uv run python scripts/smoke_cluster.py [--only aggregate]
+    .\\scripts\\dev.ps1 uv run python scripts/smoke_cluster.py [--only join-shuffle]
 
 Read-only on the catalog: it reads `nyc.yellow_tripdata` and writes nothing to any
 namespace. It writes only under `s3://icefleet-shuffle/` (the bucket is created if
@@ -64,9 +75,40 @@ def aggregate(session: Session) -> DataFrame:
     )
 
 
-QUERIES: dict[str, tuple[Callable[[Session], DataFrame], int]] = {
-    "projection": (projection, 1),
-    "aggregate": (aggregate, 2),
+def join(session: Session) -> DataFrame:
+    zones = (
+        session.table(TABLE)
+        .filter(
+            (F.col("tpep_pickup_datetime") >= "2024-01-01")
+            & (F.col("tpep_pickup_datetime") < "2024-02-01")
+        )
+        .groupBy("PULocationID")
+        .agg(F.avg("total_amount").alias("zone_avg_total"), F.count("*").alias("zone_trips"))
+    )
+    trips = (
+        session.table(TABLE)
+        .filter((F.col("trip_distance") > 50) & (F.col("total_amount") > 0))
+        .select("VendorID", "tpep_pickup_datetime", "PULocationID", "trip_distance", "total_amount")
+    )
+    return trips.join(zones, "PULocationID")
+
+
+#: name -> (query, distributed stages expected, extra icefleet.* settings, explain must say)
+QUERIES: dict[str, tuple[Callable[[Session], DataFrame], int, dict[str, str], str]] = {
+    "projection": (projection, 1, {}, "-> result"),
+    "aggregate": (aggregate, 2, {}, "partial:"),
+    "join-broadcast": (
+        join,
+        3,
+        {"icefleet.broadcast.thresholdBytes": "1GiB"},
+        "broadcast hash join",
+    ),
+    "join-shuffle": (
+        join,
+        3,
+        {"icefleet.broadcast.thresholdBytes": "0"},
+        "the right side already partitioned by the keys",
+    ),
 }
 
 
@@ -95,12 +137,36 @@ def check(
     name: str,
     query: Callable[[Session], DataFrame],
     stages: int,
+    settings: dict[str, str],
+    expect: str,
     cluster: ClusterSession,
     oracle: Session,
     exchange: ObjectStoreExchange,
 ) -> bool:
     print(f"\n=== {name} ===")
-    query(cluster).explain()
+    for key, value in settings.items():
+        cluster.conf.set(key, value)
+    try:
+        return _check(name, query, stages, expect, cluster, oracle, exchange)
+    finally:
+        for key in settings:
+            cluster.conf.unset(key)
+
+
+def _check(
+    name: str,
+    query: Callable[[Session], DataFrame],
+    stages: int,
+    expect: str,
+    cluster: ClusterSession,
+    oracle: Session,
+    exchange: ObjectStoreExchange,
+) -> bool:
+    plan = query(cluster)._explain_text(verbose=False)
+    print(plan.split("\n\n", 1)[0])  # the distributed section; icetl's own follows
+    if expect not in plan:
+        print(f"FAIL: explain() does not say {expect!r}")
+        return False
 
     started = time.perf_counter()
     actual = query(cluster).toArrow()

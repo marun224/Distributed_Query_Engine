@@ -35,15 +35,29 @@ class ThreadPoolScheduler:
         return f"thread pool over {self._cluster.summary()}"
 
     def run(self, plan: StagePlan, *, query_id: str, exchange: Exchange) -> list[TaskResult]:
-        """Every stage in order, each fully before the next (a blocking shuffle): a stage's
-        tasks are built from the manifests of the stages before it, never from a glob."""
+        """The stages in waves: every stage whose inputs have all completed runs in the
+        next wave, its tasks sharing the slots with the other stages of that wave
+        (kickoff answer 6 of Phase 3). A stage starts only after every stage it reads has
+        finished (a blocking shuffle), and its tasks are built from their manifests,
+        never from a glob."""
         results: list[TaskResult] = []
-        for stage in plan.stages:
-            specs = stage.tasks(
-                query_id, exchange, results, target_file_bytes=self._target_file_bytes
-            )
+        done: set[int] = set()
+        pending = list(plan.stages)
+        while pending:
+            ready = [stage for stage in pending if set(stage.depends_on) <= done]
+            if not ready:  # pragma: no cover - the planner only reads earlier stages
+                raise RuntimeError(f"query {query_id}: no stage can run; the plan has a cycle")
+            specs = [
+                spec
+                for stage in ready
+                for spec in stage.tasks(
+                    query_id, exchange, results, target_file_bytes=self._target_file_bytes
+                )
+            ]
             results.extend(self._run_tasks(specs, query_id=query_id))
-        return results
+            done |= {stage.stage_id for stage in ready}
+            pending = [stage for stage in pending if stage.stage_id not in done]
+        return sorted(results, key=lambda r: (r.stage_id, r.task_index))
 
     def _run_tasks(self, specs: list[TaskSpec], *, query_id: str) -> list[TaskResult]:
         if not specs:
@@ -79,4 +93,4 @@ class ThreadPoolScheduler:
                         worker.client.cancel(query_id)
         if failure is not None:
             raise failure
-        return sorted(results, key=lambda r: r.task_index)
+        return sorted(results, key=lambda r: (r.stage_id, r.task_index))

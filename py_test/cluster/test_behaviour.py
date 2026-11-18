@@ -51,16 +51,17 @@ def test_explain_shows_the_stage_and_its_splits(
     assert "== Physical Plan (DuckDB SQL) ==" in out  # icetl's own explain follows, unchanged
 
 
-def _join(session: Any) -> Any:
-    return session.table("fx.plain").join(session.table("fx.plain").select("id"), "id")
+def _uncuttable(session: Any) -> Any:
+    """A plan that runs single-node until Phase 4: a window function."""
+    return session.sql("SELECT id, row_number() OVER (ORDER BY id) AS r FROM fx.plain")
 
 
 def test_explain_says_why_a_plan_runs_single_node(
     cluster: ClusterSession, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    _join(cluster).explain()
+    _uncuttable(cluster).explain()
     out = capsys.readouterr().out
-    assert "mode: single-node -- a join -- Phase 3" in out
+    assert "mode: single-node -- a window function -- Phase 4" in out
 
 
 def test_explain_shows_an_aggregate_as_two_stages(
@@ -90,8 +91,8 @@ def test_a_plain_icetl_session_explains_exactly_as_before(
 
 def test_fallback_error_refuses_an_uncuttable_plan(fresh_cluster: ClusterSession) -> None:
     fresh_cluster.conf.set("icefleet.fallback", "error")
-    with pytest.raises(UnsupportedFeatureError, match="join"):
-        _join(fresh_cluster).toArrow()
+    with pytest.raises(UnsupportedFeatureError, match="window"):
+        _uncuttable(fresh_cluster).toArrow()
     # A cuttable plan still runs.
     assert fresh_cluster.table("fx.plain").toArrow().num_rows == 5
 
@@ -184,9 +185,9 @@ def test_a_dead_worker_fails_the_query_cleanly(fresh_cluster: ClusterSession) ->
     with pytest.raises(WorkerError, match="lost contact"):
         fresh_cluster.table("fx.many").toArrow()
     assert _leftovers(fresh_cluster) == []
-    # The session itself is still usable for what does not need the fleet (a join runs
-    # single-node until Phase 3).
-    assert _join(fresh_cluster).toArrow().num_rows == 5
+    # The session itself is still usable for what does not need the fleet (a window
+    # runs single-node until Phase 4).
+    assert _uncuttable(fresh_cluster).toArrow().num_rows == 5
 
 
 def test_a_task_error_names_the_worker_and_the_task(

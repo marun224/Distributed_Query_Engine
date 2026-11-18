@@ -10,7 +10,18 @@ import sqlglot
 from sqlglot import exp
 
 from icefleet.errors import Uncuttable
-from icefleet.plan.rel import Aggregate, Project, Query, Scan, from_sqlglot, is_aggregate_call
+from icefleet.plan.rel import (
+    JOIN_ALIAS,
+    Aggregate,
+    Join,
+    Project,
+    Query,
+    Scan,
+    from_of,
+    from_sqlglot,
+    is_aggregate_call,
+    join_kind,
+)
 
 SOURCES = cast(Any, {"fx.t": object(), "fx.u": object()})
 DUCKDB_AGGREGATES = ("list", "sum", "count", "string_agg", "histogram")
@@ -138,7 +149,34 @@ def test_positional_order_by() -> None:
 @pytest.mark.parametrize(
     ("sql", "reason"),
     [
-        ('SELECT * FROM "fx"."t" AS "t" JOIN "fx"."u" AS "u" ON "t"."a" = "u"."a"', "join"),
+        (
+            'SELECT * FROM "fx"."t" AS "t" JOIN "fx"."u" AS "u" ON "t"."a" = "u"."a"',
+            r"\* over a join",
+        ),
+        (
+            'SELECT "t"."a" FROM "fx"."t" AS "t" ASOF JOIN "fx"."u" AS "u" ON "t"."a" >= "u"."a"',
+            "ASOF join",
+        ),
+        (
+            'SELECT "t"."a" FROM "fx"."t" AS "t" WHERE "t"."a" NOT IN (SELECT "u"."a" AS "a" '
+            'FROM "fx"."u" AS "u")',
+            "subquery",
+        ),
+        (
+            'SELECT "t"."a" FROM "fx"."t" AS "t" WHERE EXISTS (SELECT 1 FROM "fx"."u" AS "u" '
+            'WHERE "u"."a" = "t"."a")',
+            "subquery",
+        ),
+        (
+            'SELECT "t"."a" FROM "fx"."t" AS "t" WHERE "t"."a" IN (SELECT "u"."a" AS "a" '
+            'FROM "fx"."u" AS "u" WHERE "u"."b" = "t"."b")',
+            "subquery",
+        ),
+        (
+            'SELECT "t"."a" FROM "fx"."t" AS "t" WHERE "t"."a" > 1 OR "t"."a" IN '
+            '(SELECT "u"."a" AS "a" FROM "fx"."u" AS "u")',
+            "subquery",
+        ),
         ('SELECT ROW_NUMBER() OVER (ORDER BY "t"."a") FROM "fx"."t" AS "t"', "window"),
         ('SELECT "t"."a" FROM "fx"."t" AS "t" WHERE "t"."a" IN (SELECT 1)', "subquery"),
         ('SELECT "a" FROM "fx"."t" UNION ALL SELECT "a" FROM "fx"."u"', "set operation"),
@@ -180,3 +218,118 @@ def test_the_original_tree_is_not_touched() -> None:
     query = from_sqlglot(tree, SOURCES)
     assert isinstance(query, Query) and isinstance(query.root, Project)
     assert tree.sql(dialect="duckdb") == before
+
+
+# -- joins (Phase 3) ---------------------------------------------------------------------
+
+JOIN_ON = 'FROM "fx"."t" AS "t" JOIN "fx"."u" AS "u" ON "t"."a" = "u"."a"'
+
+
+def test_a_join_is_a_join_over_its_relations() -> None:
+    query = recognise(f'SELECT "t"."a" AS "a", "u"."b" AS "b" {JOIN_ON} WHERE "t"."b" > 1')
+    assert isinstance(query, Query), query
+    assert shape(query) == ["Join", "Scan", "Scan"]
+    assert [s.key for s in query.scans] == ["fx.t", "fx.u"]
+
+
+def test_a_self_join_has_a_scan_per_reference() -> None:
+    query = recognise(
+        'SELECT "a"."a" AS "x" FROM "fx"."t" AS "a" JOIN "fx"."t" AS "b" ON "a"."a" = "b"."a" + 1'
+    )
+    assert isinstance(query, Query), query
+    scans = query.scans
+    assert [s.key for s in scans] == ["fx.t", "fx.t"]
+    assert [s.table.alias_or_name for s in scans if s.table is not None] == ["a", "b"]
+
+
+def test_an_aggregating_join_is_split_into_an_aggregate_over_the_join() -> None:
+    query = recognise(
+        f'SELECT "u"."b" AS "b", SUM("t"."a") AS "s", COUNT(*) AS "n" {JOIN_ON} GROUP BY "u"."b"'
+    )
+    assert isinstance(query, Query), query
+    assert shape(query) == ["Aggregate", "Join", "Scan", "Scan"]
+    aggregate = query.root
+    assert isinstance(aggregate, Aggregate)
+    relation = from_of(aggregate.select)
+    assert relation is not None and relation.alias_or_name == JOIN_ALIAS
+    assert aggregate.select.sql(dialect="duckdb").startswith(
+        f'SELECT "{JOIN_ALIAS}"."b" AS "b", SUM("{JOIN_ALIAS}"."a") AS "s"'
+    )
+    join = aggregate.child
+    assert isinstance(join, Join)
+    assert [p.alias_or_name for p in join.select.expressions] == ["b", "a"]
+
+
+def test_columns_of_the_same_name_are_told_apart_when_split() -> None:
+    query = recognise(f'SELECT "t"."a" AS "x", MAX("u"."a") AS "m" {JOIN_ON} GROUP BY "t"."a"')
+    assert isinstance(query, Query)
+    join = query.aggregate.child if query.aggregate else None
+    assert isinstance(join, Join)
+    assert [p.alias_or_name for p in join.select.expressions] == ["t_a", "u_a"]
+
+
+def test_in_a_subquery_becomes_a_semi_join() -> None:
+    query = recognise(
+        'SELECT "t"."a" AS "a" FROM "fx"."t" AS "t" WHERE "t"."b" > 1 AND "t"."a" IN '
+        '(SELECT "u"."a" AS "a" FROM "fx"."u" AS "u")'
+    )
+    assert isinstance(query, Query), query
+    assert shape(query) == ["Join", "Scan", "Project", "Scan"]
+    sql = query.tree.sql(dialect="duckdb")
+    assert 'SEMI JOIN (SELECT "u"."a" AS "a" FROM "fx"."u" AS "u") AS "__icefleet_in0"' in sql
+    assert 'ON "t"."a" = "__icefleet_in0"."a"' in sql
+    assert 'WHERE "t"."b" > 1' in sql and " IN " not in sql
+
+
+def test_the_semi_join_returns_what_in_returns_nulls_included() -> None:
+    """In a WHERE, NULL and false both drop a row: `x IN (...)` and the semi join agree
+    when x is NULL, when the subquery yields NULL, and when nothing matches."""
+    import duckdb
+
+    con = duckdb.connect()
+    con.execute("CREATE SCHEMA fx")
+    con.execute(
+        "CREATE TABLE fx.t AS SELECT * FROM (VALUES (1, 5), (2, 5), (NULL, 5), (4, 0)) v(a, b)"
+    )
+    con.execute("CREATE TABLE fx.u AS SELECT * FROM (VALUES (1), (1), (NULL), (4)) v(a)")
+    sql = (
+        'SELECT "t"."a" AS "a" FROM "fx"."t" AS "t" WHERE "t"."b" > 1 AND "t"."a" IN '
+        '(SELECT "u"."a" AS "a" FROM "fx"."u" AS "u")'
+    )
+    query = recognise(sql)
+    assert isinstance(query, Query)
+    original = sorted(con.execute(sql).fetchall(), key=str)
+    rewritten = sorted(con.execute(query.tree.sql(dialect="duckdb")).fetchall(), key=str)
+    assert rewritten == original == [(1,)]
+
+
+@pytest.mark.parametrize(
+    ("join", "kind"),
+    [
+        ("JOIN", "inner"),
+        ("INNER JOIN", "inner"),
+        ("LEFT JOIN", "left"),
+        ("LEFT OUTER JOIN", "left"),
+        ("RIGHT JOIN", "right"),
+        ("FULL OUTER JOIN", "full"),
+        ("SEMI JOIN", "semi"),
+        ("ANTI JOIN", "anti"),
+    ],
+)
+def test_join_kinds(join: str, kind: str) -> None:
+    tree = cast(
+        exp.Select,
+        sqlglot.parse_one(
+            f'SELECT 1 FROM "fx"."t" AS "t" {join} "fx"."u" AS "u" ON TRUE', dialect="duckdb"
+        ),
+    )
+    assert join_kind(tree.args["joins"][0]) == kind
+
+
+def test_a_cross_join_and_a_comma_are_cross() -> None:
+    for sql in (
+        'SELECT 1 FROM "fx"."t" AS "t" CROSS JOIN "fx"."u" AS "u"',
+        'SELECT 1 FROM "fx"."t" AS "t", "fx"."u" AS "u"',
+    ):
+        tree = cast(exp.Select, sqlglot.parse_one(sql, dialect="duckdb"))
+        assert join_kind(tree.args["joins"][0]) == "cross"
