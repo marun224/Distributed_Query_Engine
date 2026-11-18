@@ -380,6 +380,63 @@ def build_empty(catalog: Catalog) -> FixtureTable:
     return FixtureTable(f"{NAMESPACE}.empty", table, rows=0)
 
 
+def _two_files(
+    catalog: Catalog, name: str, schema: Schema, rows: list[dict[str, Any]]
+) -> FixtureTable:
+    """`rows` appended in two halves -- two files, so a window over them distributes."""
+    table = catalog.create_table(f"{NAMESPACE}.{name}", schema=schema)
+    half = len(rows) // 2
+    for chunk in (rows[:half], rows[half:]):
+        table.append(pa.Table.from_pylist(chunk, schema=schema.as_arrow()))
+    return FixtureTable(f"{NAMESPACE}.{name}", table, rows=len(rows))
+
+
+def build_ties(catalog: Catalog) -> FixtureTable:
+    """icetl's `ties` frame (tests/fixture/test_window.py): x ties at 20, so RANGE and
+    ROWS frames disagree."""
+    schema = Schema(
+        NestedField(1, "id", LongType(), required=False),
+        NestedField(2, "x", DoubleType(), required=False),
+    )
+    rows: list[dict[str, Any]] = [
+        {"id": 1, "x": 10.0},
+        {"id": 2, "x": 20.0},
+        {"id": 3, "x": 20.0},
+        {"id": 4, "x": 40.0},
+    ]
+    return _two_files(catalog, "ties", schema, rows)
+
+
+def build_gaps(catalog: Catalog) -> FixtureTable:
+    """icetl's `gaps` frame: NULLs in the value column, for ignoreNulls and defaults."""
+    schema = Schema(
+        NestedField(1, "id", LongType(), required=False),
+        NestedField(2, "v", StringType(), required=False),
+    )
+    rows: list[dict[str, Any]] = [
+        {"id": 1, "v": None},
+        {"id": 2, "v": "b"},
+        {"id": 3, "v": None},
+        {"id": 4, "v": "d"},
+    ]
+    return _two_files(catalog, "gaps", schema, rows)
+
+
+def build_groups(catalog: Catalog) -> FixtureTable:
+    """icetl's per-partition frames, in one table: g a/a/b with x 1/2/1, y 1.0/2.0/5.0."""
+    schema = Schema(
+        NestedField(1, "g", StringType(), required=False),
+        NestedField(2, "x", LongType(), required=False),
+        NestedField(3, "y", DoubleType(), required=False),
+    )
+    rows: list[dict[str, Any]] = [
+        {"g": "a", "x": 1, "y": 1.0},
+        {"g": "a", "x": 2, "y": 2.0},
+        {"g": "b", "x": 1, "y": 5.0},
+    ]
+    return _two_files(catalog, "groups", schema, rows)
+
+
 BUILDERS = {
     "plain": build_plain,
     "partitioned": build_partitioned,
@@ -389,6 +446,9 @@ BUILDERS = {
     "mor": build_mor,
     "many": build_many,
     "empty": build_empty,
+    "ties": build_ties,
+    "gaps": build_gaps,
+    "groups": build_groups,
 }
 FIXTURE_NAMES = tuple(BUILDERS)
 

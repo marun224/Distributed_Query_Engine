@@ -418,3 +418,48 @@ grep -E "KEY|SECRET|PASSWORD|TOKEN" .env | ... git grep -lIF --untracked   # rea
 git add -A
 git commit -F -                                            # "Phase 3: joins -- broadcast and shuffle hash"
 ```
+
+## 2026-11-18 — Phase 4 kickoff and spike (read-only)
+
+```powershell
+# icetl: DataFrame set ops / rollup / cube / dropDuplicates; its window tests (tests/fixture/test_window.py)
+docker cp <scratchpad>\p4_spike.py icefleet-dev:/tmp/p4_spike.py
+.\scripts\dev.ps1 uv run python /tmp/p4_spike.py > <scratchpad>\p4_spike.out   # 28 shapes, warehouse in /tmp/p4_spike
+# tracker: Phase 4 checklist (4.0 asked, 4.1 spike done)
+```
+
+## 2026-11-18 — Phase 4 build (owner: "yes to all" to the 8 kickoff questions)
+
+```powershell
+# Source edits with the Edit/Write tools and Python text scripts in the scratchpad (utf-8, LF).
+# New: plan/sort.py; rewritten: plan/rel.py, plan/stages.py, plan/aggregates.py;
+# changed: tasks.py (sample files), sinks.py (key sample), config.py, describe.py, scheduler, session
+docker cp <scratchpad>\p4_groups.py icefleet-dev:/tmp/; .\scripts\dev.ps1 uv run python /tmp/p4_groups.py
+#   sqlglot: ROLLUP / CUBE / GROUPING SETS are nodes among the GROUP BY keys; GROUPING() is exp.Grouping;
+#   DuckDB's GROUPING returns BIGINT, first argument the highest bit
+.\scripts\dev.ps1 uv run python -m ruff format py_src; ... ruff check ...; ... mypy                 # iterated
+.\scripts\dev.ps1 uv run python -m pytest -q -p no:randomly py_test/unit py_test/test_seams.py
+#   7 failed: shapes Phases 2-3 refused are now recognised -> tests moved to recognition / grouping-set cases
+.\scripts\dev.ps1 uv run python -m pytest -q -p no:randomly py_test/cluster -x
+#   single-node examples moved off windows / OFFSET onto createDataFrame (always single-node)
+.\scripts\dev.ps1 uv run python -m pytest -q -p no:randomly py_test/cluster/test_windows.py -k local2   # 48 passed
+.\scripts\dev.ps1 uv run python -m pytest -q -p no:randomly py_test/cluster/test_setops.py py_test/cluster/test_ordering.py -k local2
+#   DataFrame rollup()/cube() put the set in Group(rollup=[...]) -> read those arguments too;
+#   a tie test assumed NULLS LAST where the DataFrame (Spark) orders NULLS FIRST -> test fixed
+#   DISTINCT ON keeps its ORDER BY (found while writing tests) -> rel.py fix
+.\scripts\dev.ps1 uv run python -m pytest -q -p no:randomly py_test/unit/test_sort.py    # 38 passed (helper fetches keys as text: no pytz)
+.\scripts\dev.ps1 uv run tox            # 755 passed; mypy errors in test files only -> fixed
+.\scripts\dev.ps1 uv run python scripts/smoke_cluster.py --only window|rollup|union|sorted   # all OK
+.\scripts\dev.ps1 uv run tox            # lint/type/py312 (755 passed)/dist OK, 218.7 s -- Phase 4 gate green
+.\scripts\dev.ps1 uv run python scripts/smoke_cluster.py     # all eight OK, every prefix removed
+# docs: plan v1.6, task_tracker (Phase 4 built), divergence.md, README
+```
+
+## 2026-11-18 — commit Phase 4 (owner: "pls commit phase 4 chnages to git"; not pushed)
+
+```bash
+git check-ignore -q .env                                   # .env ignored
+grep -E "KEY|SECRET|PASSWORD|TOKEN" .env | ... git grep -lIF --untracked   # real .env values in 0 files
+git add -A                                                 # (most files were already staged, not by this session)
+git commit -F -                                            # "Phase 4: windows, ordering, set operations, grouping sets"
+```

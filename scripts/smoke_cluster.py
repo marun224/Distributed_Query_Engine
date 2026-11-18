@@ -1,4 +1,4 @@
-"""Proof of life against the dev catalog (PLAN Phases 1, 2 and 3, §3.4).
+"""Proof of life against the dev catalog (PLAN Phases 1 to 4, §3.4).
 
 `local[2]` workers, the exchange in MinIO, queries over `nyc.yellow_tripdata` (41M rows,
 62 files), each compared with icetl's own answer:
@@ -18,6 +18,15 @@
     join-shuffle    the same join with icefleet.broadcast.thresholdBytes=0: the trips are
                     shuffled by zone, and the join runs in the zone aggregate's own final
                     stage, which is already partitioned by zone (Phase 3)
+    window          the top 3 fares per pickup zone in January 2024: rank() and QUALIFY,
+                    hashed by zone (Phase 4)
+    rollup          revenue by ROLLUP (VendorID, payment_type): every grouping set in one
+                    shuffle (Phase 4)
+    union           trips per vendor in January and February 2024, a UNION ALL of the two
+                    months aggregated: a partial per branch, one final (Phase 4)
+    sorted          the long trips ordered by fare: over icefleet.sort.coordinatorBytes,
+                    so sorted by range partitions on the workers, and the order checked key
+                    by key against icetl's (Phase 4)
 
 and each query's exchange prefix checked gone afterwards.
 
@@ -93,6 +102,43 @@ def join(session: Session) -> DataFrame:
     return trips.join(zones, "PULocationID")
 
 
+JANUARY = "tpep_pickup_datetime >= '2024-01-01' AND tpep_pickup_datetime < '2024-02-01'"
+FEBRUARY = "tpep_pickup_datetime >= '2024-02-01' AND tpep_pickup_datetime < '2024-03-01'"
+
+
+def window(session: Session) -> DataFrame:
+    return session.sql(
+        "SELECT PULocationID, tpep_pickup_datetime, total_amount FROM nyc.yellow_tripdata "
+        f"WHERE {JANUARY} "
+        "QUALIFY rank() OVER (PARTITION BY PULocationID ORDER BY total_amount DESC) <= 3"
+    )
+
+
+def rollup(session: Session) -> DataFrame:
+    return session.sql(
+        "SELECT VendorID, payment_type, grouping(VendorID, payment_type) AS level, "
+        "count(*) AS trips, sum(total_amount) AS revenue FROM nyc.yellow_tripdata "
+        "WHERE tpep_pickup_datetime >= '2024-01-01' GROUP BY ROLLUP (VendorID, payment_type)"
+    )
+
+
+def union(session: Session) -> DataFrame:
+    return session.sql(
+        "SELECT month, VendorID, count(*) AS trips, sum(total_amount) AS revenue FROM ("
+        f"SELECT 'jan' AS month, VendorID, total_amount FROM nyc.yellow_tripdata WHERE {JANUARY} "
+        "UNION ALL "
+        f"SELECT 'feb', VendorID, total_amount FROM nyc.yellow_tripdata WHERE {FEBRUARY}"
+        ") q GROUP BY month, VendorID"
+    )
+
+
+def ordered(session: Session) -> DataFrame:
+    return projection(session).orderBy(F.col("total_cents").desc(), "tpep_pickup_datetime")
+
+
+#: The queries whose order is part of the answer, and the columns that make it.
+ORDER_KEYS: dict[str, tuple[str, ...]] = {"sorted": ("total_cents", "tpep_pickup_datetime")}
+
 #: name -> (query, distributed stages expected, extra icefleet.* settings, explain must say)
 QUERIES: dict[str, tuple[Callable[[Session], DataFrame], int, dict[str, str], str]] = {
     "projection": (projection, 1, {}, "-> result"),
@@ -109,6 +155,10 @@ QUERIES: dict[str, tuple[Callable[[Session], DataFrame], int, dict[str, str], st
         {"icefleet.broadcast.thresholdBytes": "0"},
         "the right side already partitioned by the keys",
     ),
+    "window": (window, 2, {}, "window: rank · partition by"),
+    "rollup": (rollup, 2, {}, "3 grouping sets, one shuffle"),
+    "union": (union, 3, {}, "final: "),
+    "sorted": (ordered, 3, {}, "range partition by"),
 }
 
 
@@ -192,13 +242,23 @@ def _check(
     if problem:
         print(f"FAIL: {problem}")
         return False
+    keys = ORDER_KEYS.get(name)
+    if keys:
+        # Ties may come in either order; the keys may not.
+        got = [tuple(row[k] for k in keys) for row in actual.select(list(keys)).to_pylist()]
+        want = [tuple(row[k] for k in keys) for row in expected.select(list(keys)).to_pylist()]
+        if got != want:
+            first = next(i for i, (a, b) in enumerate(zip(got, want, strict=True)) if a != b)
+            print(f"FAIL: out of order at row {first}: {got[first]} != {want[first]}")
+            return False
+        print(f"ordered: {len(got)} rows in icetl's key order")
     last = cluster._last_run
     assert last is not None and last.query_id is not None
     if exchange.exists(exchange.query_prefix(last.query_id)):
         print(f"FAIL: {exchange.query_prefix(last.query_id)} was left behind")
         return False
-    if name == "aggregate":
-        for row in actual.sort_by("VendorID").to_pylist():
+    if name in ("aggregate", "rollup"):
+        for row in actual.sort_by([(c, "ascending") for c in actual.column_names[:2]]).to_pylist():
             print(f"  {row}")
     print("OK: identical to icetl, exchange prefix removed")
     return True

@@ -52,8 +52,8 @@ def test_explain_shows_the_stage_and_its_splits(
 
 
 def _uncuttable(session: Any) -> Any:
-    """A plan that runs single-node until Phase 4: a window function."""
-    return session.sql("SELECT id, row_number() OVER (ORDER BY id) AS r FROM fx.plain")
+    """A plan that always runs single-node: rows only this session holds."""
+    return session.createDataFrame([(i,) for i in range(5)], ["id"]).filter("id >= 0")
 
 
 def test_explain_says_why_a_plan_runs_single_node(
@@ -61,7 +61,7 @@ def test_explain_says_why_a_plan_runs_single_node(
 ) -> None:
     _uncuttable(cluster).explain()
     out = capsys.readouterr().out
-    assert "mode: single-node -- a window function -- Phase 4" in out
+    assert "mode: single-node -- a FROM that is not a single Iceberg table" in out
 
 
 def test_explain_shows_an_aggregate_as_two_stages(
@@ -91,7 +91,7 @@ def test_a_plain_icetl_session_explains_exactly_as_before(
 
 def test_fallback_error_refuses_an_uncuttable_plan(fresh_cluster: ClusterSession) -> None:
     fresh_cluster.conf.set("icefleet.fallback", "error")
-    with pytest.raises(UnsupportedFeatureError, match="window"):
+    with pytest.raises(UnsupportedFeatureError, match="not a single Iceberg table"):
         _uncuttable(fresh_cluster).toArrow()
     # A cuttable plan still runs.
     assert fresh_cluster.table("fx.plain").toArrow().num_rows == 5
@@ -185,8 +185,7 @@ def test_a_dead_worker_fails_the_query_cleanly(fresh_cluster: ClusterSession) ->
     with pytest.raises(WorkerError, match="lost contact"):
         fresh_cluster.table("fx.many").toArrow()
     assert _leftovers(fresh_cluster) == []
-    # The session itself is still usable for what does not need the fleet (a window
-    # runs single-node until Phase 4).
+    # The session itself is still usable for what does not need the fleet.
     assert _uncuttable(fresh_cluster).toArrow().num_rows == 5
 
 

@@ -19,15 +19,17 @@ df.explain()  # == Distributed Plan ==: partial sums -> shuffle by VendorID -> f
 df.toArrow()  # the same rows icetl returns on one machine
 ```
 
-**Status: Phase 3 built.** Filters, projections, aggregation (`GROUP BY`, global
+**Status: Phase 4 built.** Filters, projections, aggregation (`GROUP BY`, global
 aggregates, `HAVING`, `DISTINCT`) and joins run on a fleet of DuckDB workers (`local[N]`,
 `static://`, `k8s://`): partial aggregates on the splits, a hash shuffle through the object
 store, final aggregates per partition; inner, left, right, full, semi and anti joins (and
 `IN (SELECT ...)`) either broadcast their small side
 (`icefleet.broadcast.thresholdBytes`, 64 MiB) or shuffle both sides by the keys, skipping
-a side already partitioned that way. `ORDER BY` / `LIMIT` on top are applied by the
-coordinator. Windows and set operations (Phase 4) run single-node through icetl, and
-`explain()` says why. The design is in
+a side already partitioned that way. Windows (and `QUALIFY`) are hashed by their
+`PARTITION BY`; `UNION ALL`, `UNION`, `INTERSECT` and `EXCEPT` run on the workers;
+grouping sets, `ROLLUP` and `CUBE` take one shuffle; a large `ORDER BY` is sorted by
+range partitions on the workers. What cannot be distributed runs single-node through
+icetl, and `explain()` says why. The design is in
 [docs/PLAN_distributed_engine.md](docs/PLAN_distributed_engine.md); what is done is in
 [docs/task_tracker.md](docs/task_tracker.md); how work runs is in
 [docs/workflow_instructions_file.md](docs/workflow_instructions_file.md).

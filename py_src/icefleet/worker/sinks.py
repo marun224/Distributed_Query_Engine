@@ -52,7 +52,26 @@ def write_result(
         f"RETURN_STATS true)"
     )
     rows = cursor.execute(copy, dict(parameters)).fetchall()
-    return [OutputFile(path=str(row[0]), rows=int(row[1]), bytes=int(row[2])) for row in rows]
+    written = [OutputFile(path=str(row[0]), rows=int(row[1]), bytes=int(row[2])) for row in rows]
+    if sink.sample_columns:
+        written.append(_write_sample(cursor, written, sink))
+    return written
+
+
+def _write_sample(cursor: Any, written: list[OutputFile], sink: SinkSpec) -> OutputFile:
+    """A reservoir sample of the sort keys, read back from the rows just written (one
+    pass over the query, a cheap second one over its key columns) -- a range sort's
+    boundaries come from these (`plan/sort.py`)."""
+    columns = ", ".join('"' + c.replace('"', '""') + '"' for c in sink.sample_columns)
+    files = "[" + ", ".join(_quote(f.path) for f in written) + "]"
+    path = sink.location.rstrip("/") + "/sample.parquet"
+    copy = (
+        f"COPY (SELECT {columns} FROM read_parquet({files}, union_by_name => false, "
+        f"hive_partitioning => false) USING SAMPLE reservoir({int(sink.sample_rows)} ROWS) "
+        f"REPEATABLE (42)) TO {_quote(path)} (FORMAT parquet, RETURN_STATS true)"
+    )
+    row = cursor.execute(copy).fetchall()[0]
+    return OutputFile(path=str(row[0]), rows=int(row[1]), bytes=int(row[2]), sample=True)
 
 
 def write_shuffle(

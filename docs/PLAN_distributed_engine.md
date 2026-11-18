@@ -1,6 +1,6 @@
 # icefleet — a distributed SQL and DataFrame engine over Apache Iceberg, executed by a fleet of DuckDB workers
 
-**Status:** Draft v1.5 — 2026-11-18, decisions locked (§2); v1.1 adds decision 26 (HTTP control plane) and decision 27 (Kubernetes + Argo Workflows as the deployment target); v1.2 adds decision 28 (development in a Linux dev container); v1.3 records Phase 1 as built (§6), corrects §4.6 (DuckDB writes field ids) and extends the seam table (§4.10); v1.4 records Phase 2 as built (§6), corrects §4.1 (DuckDB hashes integers by width) and §4.4 (shuffle files are not rolled), extends §4.10 and §5; v1.5 records Phase 3 as built (§6), corrects §4.3 (join strategy chosen when planning, from upper bounds) and §4.4 (broadcast), updates §5
+**Status:** Draft v1.6 — 2026-11-18, decisions locked (§2); v1.1 adds decision 26 (HTTP control plane) and decision 27 (Kubernetes + Argo Workflows as the deployment target); v1.2 adds decision 28 (development in a Linux dev container); v1.3 records Phase 1 as built (§6), corrects §4.6 (DuckDB writes field ids) and extends the seam table (§4.10); v1.4 records Phase 2 as built (§6), corrects §4.1 (DuckDB hashes integers by width) and §4.4 (shuffle files are not rolled), extends §4.10 and §5; v1.5 records Phase 3 as built (§6), corrects §4.3 (join strategy chosen when planning, from upper bounds) and §4.4 (broadcast), updates §5; v1.6 records Phase 4 as built (§6), extends §4.4 (range sort, samples) and §5, and replaces §4.2's grouping-set row (one shuffle, not one per set)
 **Owner:** Arun
 **Base:** [`icetl`](https://github.com/marun224/data_transformation_engine) 0.1.0 — single-node, sqlglot IR, PyIceberg planning, DuckDB execution. Local checkout: `E:\workspace\Transformation_Engine_08172026`.
 **State of the work:** [task_tracker.md](task_tracker.md). This file is the design; it does not say what is done.
@@ -338,7 +338,7 @@ original aggregate unchanged (P2 — always correct, sometimes slower).
 | `bool_and/or`, `bit_and/or/xor` | same | same | |
 | `count(distinct x)`, `approx_count_distinct` | — raw path — | original | two-level distinct is a Phase 7 optimisation |
 | `first`, `last`, `any_value`, `collect_list/set`, `string_agg`, `mode`, `median`, `percentile*`, `stddev*`, `var*`, `corr`, `regr_*` | — raw path — | original | nondeterministic or order-dependent; raw rows co-located by key is the only honest answer |
-| grouping sets / rollup / cube | — Phase 4 — | | one `Hash` per grouping set, `UNION ALL` of the finals |
+| grouping sets / rollup / cube | DuckDB's own `GROUPING SETS` + `__g = GROUPING(all keys)` | `GROUP BY __g, keys`; `grouping()` from `__g`'s bits | **one** shuffle by `(__g, keys)` whatever the number of sets (Phase 4, kickoff answer 6; was one `Hash` per set); the raw path repeats each row once per set |
 
 `HAVING` runs in the final stage. A global aggregate (no keys) is partial → `Single` →
 final. icetl's manifest-only `count(*)` shortcut still fires before any of this.
@@ -405,6 +405,16 @@ No cost-based join reordering (decision 6). sqlglot's `optimize_joins` already r
 > its own placeholder `__icefleet_input_<k>__` and parameter `$icefleet_input_<k>`. A
 > partition-driven stage gets a task per partition any of its partitioned inputs has
 > rows in; an input with no rows there is read as its typed empty relation.
+>
+> **As built, Phase 4 (2026-11-18):** a third input mode, `task`: a task per upstream task,
+> each reading that task's files (a range partitioning). A `result` sink may also write a
+> reservoir sample of named columns beside the rows (`SinkSpec.sample_columns`), reported
+> in the manifest as a file with `sample: true`; nothing reads it as rows. A range stage's
+> SQL carries `__ICEFLEET_RANGE_PARTITION__` until the scheduler fills in the boundaries
+> from those samples (`Stage.resolved`, `plan/sort.py`), the one step the coordinator
+> takes between stages. A top-level UNION ALL has several final stages
+> (`StagePlan.final_stages`); the coordinator reads their files stage by stage, task by
+> task, each task's in the order written.
 
 ### 4.5 Splits
 
@@ -498,6 +508,7 @@ py_src/icefleet/
     aggregates.py        decomposition table (§4.2), the partial/final rewrite
     types.py             parquet-unsafe types and their lossless stand-ins (Phase 2)
     joins.py             equality keys, which side may be broadcast, NULL-supplied relations (§4.3)
+    sort.py              range partitioning for a distributed ORDER BY: keys, samples, boundaries (Phase 4)
     splits.py            bin-packing (§4.5)
     tasks.py             TaskSpec / TaskResult (de)serialisation
     describe.py          the explain() renderer
@@ -710,6 +721,54 @@ a feeling.
 - `LIMIT` without `ORDER BY`; `UNION ALL` by manifest concatenation; `UNION`/`INTERSECT`/`EXCEPT` via `Hash(all)`.
 - Grouping sets / rollup / cube: one aggregate per set, `UNION ALL`.
 - Tests against the oracle, including icetl's `test_window.py` cases run through the cluster.
+
+**As built (2026-11-18).** Where the build differs from the list above or adds to it:
+
+- **Kickoff answers (owner, "yes to all"):** (1) windows + QUALIFY, every set operation,
+  grouping sets / ROLLUP / CUBE with `grouping()`, OFFSET, ORDER BY / LIMIT in subqueries,
+  an aggregate over an aggregate, DISTINCT ON; (2) a range sort only above
+  `icefleet.sort.coordinatorBytes` (64 MiB), the coordinator below; (3) the sort input
+  written once with a key sample per task (`icefleet.sort.sampleRows`, 1000), boundaries
+  on the coordinator between stages; (4) windows: one shuffle by the keys they share,
+  else a chain; no PARTITION BY = one partition with a warning; no reshuffle of rows
+  already partitioned by a subset of the keys; (5) UNION ALL with no stage of its own,
+  the other set operations hashed on every column cast to the result type; (6) grouping
+  sets in one shuffle (§4.2); (7) top-n subqueries through one partition, an ORDER BY
+  lifted through projections and dropped under aggregates, joins, windows and set
+  operations, OFFSET at the coordinator; (8) icetl's window cases on Iceberg fixtures,
+  and a proof of life for each shape.
+- **Four more node kinds** (`plan/rel.py`): `Window`, `DistinctOn`, `TopN`, `SetOp`. A
+  window over an aggregate, a window over a join and a DISTINCT over a window are split
+  in two, like Phase 3's aggregating joins. `aggregate_calls` no longer counts a window
+  function (`sum(x) OVER (...)`) as an aggregate of its SELECT.
+- **Windows** (`plan/stages.py`): the input is narrowed to the columns the SELECT reads,
+  its WHERE applied, then hashed by the PARTITION BY keys (decision 18's single partition
+  when there are none); groups of windows sharing no key are computed one shuffle after
+  another into hidden `__icefleet_w<n>` columns, the group QUALIFY needs last. A window
+  over rows already partitioned by a subset of its keys (a join on the key) does not
+  reshuffle them.
+- **DISTINCT ON keeps its ORDER BY.** The ORDER BY of a DISTINCT ON SELECT chooses which
+  row survives, so it stays in the SELECT (and is copied, not moved, to the coordinator);
+  a DISTINCT ON subquery's ORDER BY is never moved or dropped.
+- **UNION ALL** is a pipeline of branches: wrapping steps (projections, a join side's
+  projection, a window's narrowing) map over the branches, closing steps (a shuffle, a
+  broadcast, the result) close each branch into its own stage and read them back as a
+  union of inputs, an aggregate runs its partial in every branch. Branches are first cast
+  to the set operation's result names and types.
+- **The range sort** (`plan/sort.py`, decision 17): stage *a* is the query with a sample
+  of the sort keys per task; stage *b* (a task per task of *a*) puts each row in the range
+  partition its keys fall in -- a CASE over "sorts before boundary i", honouring ASC /
+  DESC and NULLS FIRST / LAST, the boundaries carried as `CAST('<text>' AS <type>)`;
+  stage *c* sorts each partition; the coordinator reads the partitions in order. A
+  hypothesis test checks that the partition never decreases in sort order and equal keys
+  share one, for any boundaries, which is all correctness needs; the sample only balances.
+  Keys of nested types keep the coordinator sort.
+- **Proof of life** (`smoke_cluster.py`, `nyc.yellow_tripdata`): the top 3 fares per pickup
+  zone (rank + QUALIFY, 770 rows), revenue by ROLLUP (VendorID, payment_type) (20 rows,
+  one shuffle), a UNION ALL of two months aggregated (5 rows, a partial per branch), and
+  the 6,485 long trips ordered by fare -- range-sorted with no setting changed, since the
+  scan's bound is 330 MB, and the order checked key by key against icetl's. All equal to
+  icetl, every exchange prefix removed; the four earlier queries rerun green.
 
 ### Phase 5 — Distributed writes
 

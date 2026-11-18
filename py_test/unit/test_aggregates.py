@@ -291,14 +291,72 @@ def test_the_raw_path_says_why(con: duckdb.DuckDBPyConnection) -> None:
     assert cut.why_raw is not None and "DISTINCT" in cut.why_raw
 
 
-def test_grouping_sets_wait_for_phase_4(con: duckdb.DuckDBPyConnection) -> None:
-    names = AGGREGATES
-    sql = 'SELECT "t"."b", COUNT(*) FROM "fx"."t" AS "t" GROUP BY ROLLUP ("t"."b")'
+GROUPING_SETS = {
+    "rollup": (
+        'SELECT "t"."b" AS "b", "t"."f" AS "f", COUNT(*) AS "n", SUM("t"."a") AS "s" '
+        'FROM "fx"."t" AS "t" GROUP BY ROLLUP ("t"."b", "t"."f")',
+        "partial",
+    ),
+    "cube with grouping()": (
+        'SELECT "t"."b" AS "b", "t"."f" AS "f", GROUPING("t"."b", "t"."f") AS "g", '
+        'GROUPING("t"."f") AS "gf", AVG("t"."d") AS "a", MAX("t"."ts") AS "m" '
+        'FROM "fx"."t" AS "t" GROUP BY CUBE ("t"."b", "t"."f")',
+        "partial",
+    ),
+    "grouping sets with the empty set": (
+        'SELECT "t"."b" AS "b", "t"."a" % 3 AS "m", SUM("t"."p") AS "s" FROM "fx"."t" AS "t" '
+        'GROUP BY GROUPING SETS (("t"."b"), ("t"."a" % 3), ())',
+        "partial",
+    ),
+    "a key and a rollup, with HAVING on grouping()": (
+        'SELECT "t"."f" AS "f", "t"."b" AS "b", COUNT(*) AS "n" FROM "fx"."t" AS "t" '
+        'GROUP BY "t"."f", ROLLUP ("t"."b") HAVING GROUPING("t"."b") = 0 OR COUNT(*) > 10',
+        "partial",
+    ),
+    "raw: count distinct over a rollup": (
+        'SELECT "t"."b" AS "b", "t"."f" AS "f", COUNT(DISTINCT "t"."a") AS "nd", '
+        'GROUPING("t"."b", "t"."f") AS "g" FROM "fx"."t" AS "t" '
+        'GROUP BY ROLLUP ("t"."b", "t"."f")',
+        "raw",
+    ),
+    "raw: a key that is also aggregated": (
+        'SELECT "t"."a" % 2 AS "k", LIST("t"."a" ORDER BY "t"."id") AS "l" FROM "fx"."t" AS "t" '
+        'GROUP BY CUBE ("t"."a" % 2)',
+        "raw",
+    ),
+    "grouping() without grouping sets": (
+        'SELECT "t"."b" AS "b", GROUPING("t"."b") AS "g", COUNT(*) AS "n" FROM "fx"."t" AS "t" '
+        'GROUP BY "t"."b"',
+        "partial",
+    ),
+}
+
+
+@pytest.mark.parametrize("name", list(GROUPING_SETS))
+def test_grouping_sets_equal_the_original(
+    name: str, con: duckdb.DuckDBPyConnection, tmp_path: Path
+) -> None:
+    sql, strategy = GROUPING_SETS[name]
+    check(con, sql, tmp_path, strategy)
+
+
+def test_grouping_sets_take_one_shuffle(con: duckdb.DuckDBPyConnection) -> None:
+    _, cut = cut_of(con, GROUPING_SETS["cube with grouping()"][0])
+    assert cut.grouping_sets == 4
+    assert "__g" in dict(cut.shuffle_columns)
+    assert "GROUP BY CUBE" in cut.partial.sql(dialect="duckdb")
+
+
+def test_the_same_grouping_set_twice_is_refused(con: duckdb.DuckDBPyConnection) -> None:
+    sql = (
+        'SELECT "t"."b", COUNT(*) FROM "fx"."t" AS "t" '
+        'GROUP BY GROUPING SETS (("t"."b"), ("t"."b"))'
+    )
     query = from_sqlglot(
         cast(exp.Expression, sqlglot.parse_one(sql, dialect="duckdb")),
         SOURCES,
-        aggregate_names=names,
+        aggregate_names=AGGREGATES,
     )
     assert isinstance(query, Query) and query.aggregate is not None
     cut = cut_aggregate(query.aggregate, partitions=4, describe=lambda t: describe(con, t))
-    assert isinstance(cut, Uncuttable) and "Phase 4" in cut.reason
+    assert isinstance(cut, Uncuttable) and "twice" in cut.reason

@@ -65,6 +65,7 @@ ORDERED: dict[str, Query] = {
     "order by a column not selected, with a limit": lambda s: s.sql(
         "SELECT name, qty FROM fx.many WHERE qty IS NOT NULL ORDER BY id DESC LIMIT 7"
     ),
+    "offset": lambda s: s.sql("SELECT id FROM fx.many ORDER BY id LIMIT 5 OFFSET 3"),
     "top n": lambda s: (
         s.table("fx.many")
         .filter(F.col("amount").isNotNull())
@@ -74,11 +75,10 @@ ORDERED: dict[str, Query] = {
 }
 
 SINGLE_NODE: dict[str, tuple[Query, str]] = {
-    "window": (
-        lambda s: s.sql("SELECT id, row_number() OVER (ORDER BY id) AS r FROM fx.many"),
-        "Phase 4",
+    "rows the session holds": (
+        lambda s: s.createDataFrame([(1, "a"), (2, None)], ["id", "v"]).filter("id > 0"),
+        "not a single Iceberg table",
     ),
-    "offset": (lambda s: s.sql("SELECT id FROM fx.many ORDER BY id LIMIT 5 OFFSET 3"), "Phase 4"),
     # A full join may broadcast neither side, and without an equality there is no key
     # to shuffle by (joins have their own suite, test_joins.py).
     "full join without an equality": (

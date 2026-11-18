@@ -20,6 +20,7 @@ The seams are icetl's private `_execute`, `_stream`, `_compile` and
 from __future__ import annotations
 
 import logging
+import re
 import shutil
 import tempfile
 import threading
@@ -58,6 +59,13 @@ __all__ = ["ClusterSession"]
 logger = logging.getLogger(__name__)
 
 _RESULT_PARAMETER = "icefleet_result_files"
+_FILE_NUMBER = re.compile(r"(\d+)(?=\.parquet$)")
+
+
+def _file_order(path: str) -> tuple[int, str]:
+    """`data_10.parquet` after `data_9.parquet`: a task's files in the order written."""
+    match = _FILE_NUMBER.search(path)
+    return (int(match.group(1)) if match else -1, path)
 
 
 @dataclass(frozen=True)
@@ -304,11 +312,21 @@ class ClusterSession(Session):
         cluster = self._ensure_cluster()
         exchange = self._ensure_exchange()
         query_id = f"q-{uuid.uuid4().hex[:12]}"
-        scheduler = ThreadPoolScheduler(cluster, target_file_bytes=fleet.result_file_bytes)
+        scheduler = ThreadPoolScheduler(
+            cluster, target_file_bytes=fleet.result_file_bytes, fetch=self._fetch
+        )
         try:
             results = scheduler.run(staged, query_id=query_id, exchange=exchange)
-            final = staged.final.stage_id
-            files = [f for r in results if r.stage_id == final for f in r.manifest]
+            # The final stages' files, stage by stage, task by task, each task's in the
+            # order written: for a range sort, that order is the answer's.
+            files = [
+                f
+                for stage_id in staged.finals
+                for r in sorted(
+                    (r for r in results if r.stage_id == stage_id), key=lambda r: r.task_index
+                )
+                for f in sorted(r.data, key=lambda f: _file_order(f.path))
+            ]
             if not files:
                 raise ClusterError(f"query {query_id}: the final stage reported no output files")
             size = sum(f.bytes for f in files)
@@ -344,8 +362,9 @@ class ClusterSession(Session):
         """The coordinator's read of the final stage: exactly the manifest's files.
 
         Stand-in columns are cast back to their own type, hidden order columns dropped,
-        and the ORDER BY / LIMIT lifted off the plan applied over the concatenation
-        (kickoff answer 2). Without an ORDER BY, task order is kept (DuckDB preserves it).
+        and the ORDER BY / LIMIT / OFFSET lifted off the plan applied over the
+        concatenation (kickoff answer 2). Without an ORDER BY, file order is kept (DuckDB
+        preserves it) -- which, after a range sort, is the order.
         """
         paths = [f.path for f in files]
         self._engine.ensure_object_store(paths)
@@ -367,7 +386,16 @@ class ClusterSession(Session):
             sql += " ORDER BY " + ", ".join(staged.order)
         if staged.limit is not None:
             sql += f" LIMIT {int(staged.limit)}"
+        if staged.offset:
+            sql += f" OFFSET {int(staged.offset)}"
         return sql, {_RESULT_PARAMETER: paths}
+
+    def _fetch(self, sql: str, parameters: Mapping[str, Any]) -> list[tuple[Any, ...]]:
+        """Run `sql` on the coordinator's own DuckDB (a range sort's samples)."""
+        paths = [p for value in parameters.values() if isinstance(value, list) for p in value]
+        self._engine.ensure_object_store(paths)
+        table = self._engine.arrow(sql, dict(parameters))
+        return [tuple(row.values()) for row in table.to_pylist()]
 
     # -- lifecycle ---------------------------------------------------------
 

@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from icefleet.cluster.client import Cluster, WorkerClient
     from icefleet.exchange.base import Exchange
-    from icefleet.plan.stages import StagePlan
+    from icefleet.plan.stages import Fetch, StagePlan
     from icefleet.plan.tasks import TaskResult, TaskSpec
 
 __all__ = ["ThreadPoolScheduler"]
@@ -27,9 +27,12 @@ logger = logging.getLogger(__name__)
 class ThreadPoolScheduler:
     """The long-lived-worker backend (models A and B of PLAN §3.5)."""
 
-    def __init__(self, cluster: Cluster, *, target_file_bytes: int) -> None:
+    def __init__(
+        self, cluster: Cluster, *, target_file_bytes: int, fetch: Fetch | None = None
+    ) -> None:
         self._cluster = cluster
         self._target_file_bytes = target_file_bytes
+        self._fetch = fetch
 
     def describe(self) -> str:
         return f"thread pool over {self._cluster.summary()}"
@@ -47,6 +50,13 @@ class ThreadPoolScheduler:
             ready = [stage for stage in pending if set(stage.depends_on) <= done]
             if not ready:  # pragma: no cover - the planner only reads earlier stages
                 raise RuntimeError(f"query {query_id}: no stage can run; the plan has a cycle")
+            # A range sort's partition boundaries come from the samples its inputs just
+            # wrote: the one step the coordinator takes between two stages.
+            if any(stage.range is not None for stage in ready):
+                if self._fetch is None:  # pragma: no cover - the session always passes one
+                    raise RuntimeError("a range-sorted plan needs a coordinator to fetch with")
+                fetch = self._fetch
+                ready = [stage.resolved(results, fetch) for stage in ready]
             specs = [
                 spec
                 for stage in ready

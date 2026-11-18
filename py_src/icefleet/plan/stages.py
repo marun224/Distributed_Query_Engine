@@ -8,26 +8,37 @@ The planner walks the tree `plan/rel.py` recognised, bottom up, keeping each sub
     nothing      it reads only broadcast inputs: one task
 
 -- and what its rows are known to be partitioned by. A pipeline grows by wrapping (a
-projection, an aggregate in place, a join with a broadcast side) and is *closed* into a
-stage where rows must change hands:
+projection, an aggregate in place, a join with a broadcast side, a window over rows
+already partitioned by its keys) and is *closed* into a stage where rows must change
+hands:
 
-    shuffle    COPY ... PARTITION_BY hash(keys) % n   (an aggregate's partial, a join side)
+    shuffle    COPY ... PARTITION_BY hash(keys) % n   (an aggregate's partial, a join side,
+               a window's or a DISTINCT ON's input, a set operation's branches)
     broadcast  written once, read whole by every task of the other side
     result     the root, which the coordinator reads
 
     aggregate   partial in the input's pipeline -> shuffle(keys) -> final per partition
                 (in place, no shuffle, when the input is already partitioned by a subset
-                of the keys -- kickoff answer 4)
+                of the keys); grouping sets in the same one shuffle (`aggregates.py`)
     join        broadcast the small side (PLAN §4.3), or shuffle both sides by the keys,
-                skipping a side already partitioned that way (kickoff answer 4)
+                skipping a side already partitioned that way
+    window      shuffle by the PARTITION BY keys every window shares, else one shuffle per
+                group of windows, chained; no PARTITION BY: one partition (decision 18)
+    top-n       each task's own top n, then one partition takes the top n
+    UNION ALL   no stage of its own: a pipeline of branches, each closed on its own, and
+                the reader unions their inputs
+    UNION / INTERSECT / EXCEPT   both sides hashed on every column, then per partition
+    ORDER BY    at the top, without a LIMIT, over more than icefleet.sort.coordinatorBytes:
+                a range sort (`plan/sort.py`)
 
 Every table *reference* is its own split input, so a self-join reads its table twice,
 in two stages, and a stage never binds two file lists to one icetl parameter. A stage's
 SQL is built from the optimized tree's own nodes and rendered once through icetl's
 `substitute_sources` + `build_source`, as icetl renders its own query. An input from
 another stage is a table named `__icefleet_input_<k>__`, which each task swaps for
-`read_parquet($icefleet_input_<k>)` over its files -- its partition's, or all of them for
-a broadcast -- or for a typed empty relation when no rows reached the partition.
+`read_parquet($icefleet_input_<k>)` over its files -- its partition's, all of them for a
+broadcast, one upstream task's for a range partitioning -- or for a typed empty
+relation when no rows reached the partition.
 """
 
 from __future__ import annotations
@@ -49,21 +60,36 @@ from icefleet.plan.aggregates import (
     Describe,
     cut_aggregate,
     group_keys,
+    grouping_sets_of,
 )
 from icefleet.plan.joins import BROADCASTABLE, conjuncts, equi_keys, is_deterministic, null_supplied
 from icefleet.plan.partitioning import Hash, hash_type, join_hash_type, partition_expression
 from icefleet.plan.rel import (
     Aggregate,
+    DistinctOn,
     Join,
     Project,
     Query,
     RelNode,
     Scan,
+    SetOp,
+    TopN,
+    Window,
     from_of,
     from_sqlglot,
     join_kind,
     relation_alias,
     set_from,
+    windows_of,
+)
+from icefleet.plan.sort import (
+    RANGE_TOKEN,
+    RangeSpec,
+    boundaries,
+    range_expression,
+    sample_query,
+    sort_keys,
+    sortable_by_range,
 )
 from icefleet.plan.splits import Split, file_weights, plan_splits
 from icefleet.plan.tasks import PARTITION_COLUMN, InputSpec, SinkSpec, TaskResult, TaskSpec
@@ -78,6 +104,7 @@ if TYPE_CHECKING:
     from icefleet.exchange.base import Exchange
 
 __all__ = [
+    "Fetch",
     "Stage",
     "StageInput",
     "StagePlan",
@@ -87,9 +114,16 @@ __all__ = [
 
 _INPUT_PREFIX = "__icefleet_input_"
 
+#: Runs a query on the coordinator: (sql, parameters) -> rows. A range sort's boundaries.
+Fetch = Callable[[str, Mapping[str, Any]], list[tuple[Any, ...]]]
+
 
 def _read(parameter: str) -> str:
     return f"read_parquet(${parameter}, union_by_name => false, hive_partitioning => false)"
+
+
+def _quote(name: str) -> str:
+    return exp.to_identifier(name, quoted=True).sql(dialect="duckdb")
 
 
 @dataclass(frozen=True)
@@ -97,12 +131,13 @@ class StageInput:
     """Another stage's output, read by this one.
 
     `partition`: each task reads its own hash partition of it. `all`: every task reads
-    all of it (a broadcast). `empty` is the typed relation with no rows a task reads
-    instead when its partition has no files.
+    all of it (a broadcast). `task`: a task per upstream task, each reading that task's
+    files (a range partitioning). `empty` is the typed relation with no rows a task reads
+    instead when its share has no files.
     """
 
     stage_id: int
-    mode: str  # "partition" | "all"
+    mode: str  # "partition" | "all" | "task"
     empty: str
 
     @property
@@ -116,16 +151,18 @@ class StageInput:
     @property
     def token(self) -> str:
         """How the placeholder appears in rendered DuckDB SQL."""
-        return exp.to_identifier(self.placeholder, quoted=True).sql(dialect="duckdb")
+        return _quote(self.placeholder)
 
 
 @dataclass(frozen=True)
 class Stage:
     """One stage: its SQL, what drives its tasks, what it reads, where it writes.
 
-    A stage with a `scan` has a task per split; otherwise a task per partition some
-    partitioned input has rows in (partition 0 alone when none has, or when it has no
-    partitioned input at all).
+    A stage with a `scan` has a task per split; one with a `task` input a task per
+    upstream task; otherwise a task per partition some partitioned input has rows in
+    (partition 0 alone when none has, or when it has no partitioned input at all).
+    A stage with a `range` has its partition expression filled in at run time, from
+    the samples its inputs wrote (`resolved`).
     """
 
     stage_id: int
@@ -138,6 +175,9 @@ class Stage:
     parameter: str | None = None  # the scan's file-list parameter
     splits: tuple[Split, ...] = ()
     notes: tuple[str, ...] = ()  # what explain() prints
+    sample_columns: tuple[str, ...] = ()  # a range sort's keys, sampled by every task
+    sample_rows: int = 0
+    range: RangeSpec | None = None
 
     @property
     def table(self) -> str:
@@ -148,6 +188,26 @@ class Stage:
     def depends_on(self) -> tuple[int, ...]:
         return tuple(sorted({i.stage_id for i in self.inputs}))
 
+    def resolved(self, upstream: Sequence[TaskResult], fetch: Fetch) -> Stage:
+        """This stage with its range boundaries computed from the samples upstream."""
+        if self.range is None:
+            return self
+        files = [
+            f.path
+            for r in upstream
+            if r.stage_id in self.range.sample_stages
+            for f in r.manifest
+            if f.sample
+        ]
+        rows: list[tuple[Any, ...]] = []
+        if files:
+            sql, parameters = sample_query(self.range, files)
+            rows = fetch(sql, parameters)
+        bounds = boundaries(rows, self.range.partitions)
+        return replace(
+            self, sql=self.sql.replace(RANGE_TOKEN, range_expression(self.range, bounds))
+        )
+
     def tasks(
         self,
         query_id: str,
@@ -157,33 +217,44 @@ class Stage:
         target_file_bytes: int,
     ) -> list[TaskSpec]:
         """The `TaskSpec`s of this stage, built from its inputs' manifests -- never a glob."""
+        if RANGE_TOKEN in self.sql:  # pragma: no cover - the scheduler resolves it first
+            raise ValueError(f"stage {self.stage_id}: range boundaries were never filled in")
         results: dict[int, list[TaskResult]] = defaultdict(list)
         for result in upstream:
             results[result.stage_id].append(result)
         whole: dict[int, tuple[str, ...]] = {}
         parts: dict[int, dict[int, list[str]]] = {}
+        per_task: list[tuple[int, tuple[str, ...]]] = []  # (input stage, one task's files)
         for item in self.inputs:
             ordered = sorted(results[item.stage_id], key=lambda r: r.task_index)
             if item.mode == "all":
-                whole[item.stage_id] = tuple(f.path for r in ordered for f in r.manifest)
+                whole[item.stage_id] = tuple(f.path for r in ordered for f in r.data)
                 if not whole[item.stage_id]:  # pragma: no cover - a result sink always writes
                     raise ValueError(f"stage {item.stage_id} wrote no files to broadcast")
+            elif item.mode == "task":
+                per_task += [(item.stage_id, tuple(f.path for f in r.data)) for r in ordered]
             else:
                 files: dict[int, list[str]] = defaultdict(list)
                 for r in ordered:
-                    for output in r.manifest:
+                    for output in r.data:
                         files[output.partition or 0].append(output.path)
                 parts[item.stage_id] = files
 
-        def spec(index: int, partition: int, extra: Mapping[str, InputSpec]) -> TaskSpec:
+        def spec(
+            index: int,
+            partition: int,
+            extra: Mapping[str, InputSpec],
+            one: tuple[int, tuple[str, ...]] | None = None,
+        ) -> TaskSpec:
             sql = self.sql
             inputs: dict[str, InputSpec] = dict(extra)
             for item in self.inputs:
-                paths = (
-                    whole[item.stage_id]
-                    if item.mode == "all"
-                    else tuple(parts[item.stage_id].get(partition, ()))
-                )
+                if item.mode == "all":
+                    paths = whole[item.stage_id]
+                elif item.mode == "task":
+                    paths = one[1] if one is not None and one[0] == item.stage_id else ()
+                else:
+                    paths = tuple(parts[item.stage_id].get(partition, ()))
                 if paths:
                     sql = sql.replace(item.token, _read(item.parameter))
                     inputs[item.parameter] = InputSpec(paths=paths)
@@ -200,6 +271,8 @@ class Stage:
                     location=exchange.task_location(query_id, self.stage_id, index),
                     target_file_bytes=target_file_bytes,
                     partitions=self.partitions,
+                    sample_columns=self.sample_columns,
+                    sample_rows=self.sample_rows,
                 ),
             )
 
@@ -209,6 +282,8 @@ class Stage:
                 spec(index, 0, {self.parameter: InputSpec(paths=split.paths)})
                 for index, split in enumerate(self.splits)
             ]
+        if per_task:
+            return [spec(index, 0, {}, one) for index, one in enumerate(per_task)]
         # A partition no row reached would compute nothing, so it gets no task (kickoff
         # answer 3 of Phase 2) -- except that when no partition has rows at all, partition 0
         # runs over empty inputs, so the result keeps its schema and a global aggregate
@@ -219,24 +294,42 @@ class Stage:
 
 @dataclass(frozen=True)
 class StagePlan:
-    """The stages of one query, inputs before readers, and the coordinator's last step."""
+    """The stages of one query, inputs before readers, and the coordinator's last step.
+
+    `final_stages` are the ones whose files are the result, in order (more than one for
+    a top-level UNION ALL). `ranged` says the result is already in order across them: a
+    range sort, read partition by partition, with nothing left to sort.
+    """
 
     stages: tuple[Stage, ...]
     columns: tuple[str, ...] = ()  # the result columns the caller sees
     restore: Mapping[str, str] = field(default_factory=dict)  # column -> type to cast back to
     order: tuple[str, ...] = ()  # ORDER BY items over result columns, DuckDB SQL
     limit: int | None = None
+    offset: int = 0
+    final_stages: tuple[int, ...] = ()
+    ranged: bool = False
 
     @property
     def final(self) -> Stage:
         return self.stages[-1]
 
+    @property
+    def finals(self) -> tuple[int, ...]:
+        return self.final_stages or (self.final.stage_id,)
+
     def coordinator_note(self) -> str | None:
         parts = []
+        if self.ranged:
+            parts.append("reads the range partitions in order, sorts nothing")
         if self.order:
             parts.append("order by " + ", ".join(self.order))
         if self.limit is not None:
             parts.append(f"limit {self.limit}")
+        if self.offset:
+            parts.append(f"offset {self.offset}")
+        if len(self.finals) > 1:
+            parts.append(f"concatenates stages {', '.join(str(s) for s in self.finals)}")
         return " · ".join(parts) if parts else None
 
 
@@ -265,12 +358,25 @@ def _alias(expression: exp.Expression, name: str) -> exp.Alias:
     return exp.Alias(this=expression, alias=exp.to_identifier(name, quoted=True))
 
 
+def _column(name: str, table: str | None = None) -> exp.Column:
+    return exp.column(name, table=table, quoted=True)
+
+
 def _short(expression: exp.Expression) -> str:
     """SQL for `explain()`, without the table qualifiers."""
     copy = expression.copy()
     for column in copy.find_all(exp.Column):
         column.set("table", None)
     return copy.sql(dialect="duckdb")
+
+
+def _unqualified(expression: exp.Expression, alias: str) -> exp.Expression:
+    """`expression` with `alias.` dropped from its columns (to read a narrowed pipeline)."""
+    copy = expression.copy()
+    for column in copy.find_all(exp.Column):
+        if column.table == alias:
+            column.set("table", None)
+    return copy
 
 
 def _empty_relation(columns: Sequence[tuple[str, str]]) -> str:
@@ -289,11 +395,12 @@ def _empty_select(columns: Sequence[tuple[str, str]]) -> exp.Select:
 class _Pipe:
     """An open pipeline: SQL producing a relation's rows inside one stage's tasks.
 
-    `body` is an `exp.Table` (an Iceberg table reference, or another stage's input) or
-    an `exp.Select`. `scan` / `parts` say what drives the tasks (neither: a single task
-    over broadcast inputs). `columns` are its output names where the planner needs them
-    (join sides); `hashes` what its rows are partitioned by; `estimate` an upper bound of
-    its size in parquet bytes, or None when unknown (a join's output).
+    `body` is an `exp.Table` (an Iceberg table reference) or an `exp.Select`. `scan` /
+    `parts` say what drives the tasks (neither: a single task over broadcast inputs).
+    `columns` are its output names (empty only for a bare table reference); `hashes`
+    what its rows are partitioned by; `estimate` an upper bound of its size in parquet
+    bytes, or None when unknown (a join's output). A pipeline with `branches` is their
+    UNION ALL: each branch runs in its own stages, and `body` means nothing.
     """
 
     body: exp.Expression
@@ -305,9 +412,11 @@ class _Pipe:
     hashes: tuple[Hash, ...] = ()
     estimate: int | None = None
     notes: tuple[str, ...] = ()
+    branches: tuple[_Pipe, ...] = ()
 
     def relation(self, alias: str) -> exp.Expression:
         """The pipeline as a FROM item named `alias`."""
+        assert not self.branches, "a UNION ALL pipeline has no one relation"
         if isinstance(self.body, exp.Table):
             table = self.body.copy()
             table.set("alias", _quoted_alias(alias))
@@ -315,9 +424,13 @@ class _Pipe:
         return exp.Subquery(this=self.body.copy(), alias=_quoted_alias(alias))
 
     def select(self) -> exp.Select:
+        assert not self.branches, "a UNION ALL pipeline has no one SELECT"
         if isinstance(self.body, exp.Select):
             return self.body
         return exp.select(exp.Star()).from_(self.relation("__icefleet_t"))
+
+    def leaves(self) -> tuple[_Pipe, ...]:
+        return self.branches or (self,)
 
 
 def _renamed_hashes(hashes: Sequence[Hash], names: Mapping[str, str]) -> tuple[Hash, ...]:
@@ -347,6 +460,38 @@ def _hash_over(
     if any(c is None for c in chosen):
         return ()
     return (Hash(tuple(c for c in chosen if c is not None), types, n),)
+
+
+def _columns_of(select: exp.Select, alias: str) -> list[str]:
+    """The columns of relation `alias` that `select` reads, in first-seen order."""
+    roots: list[exp.Expression] = list(select.expressions)
+    for arg in ("where", "qualify", "distinct", "order"):
+        if select.args.get(arg) is not None:
+            roots.append(select.args[arg])
+    names: list[str] = []
+    for root in roots:
+        for column in root.find_all(exp.Column):
+            if column.table == alias and column.name not in names:
+                names.append(column.name)
+    return names
+
+
+def _function_names(windows: Sequence[exp.Window]) -> str:
+    names = []
+    for window in windows:
+        function = window.this
+        while isinstance(function, (exp.IgnoreNulls, exp.RespectNulls)):
+            function = function.this
+        text = function.sql(dialect="duckdb")
+        names.append(text.split("(", 1)[0].lower())
+    return ", ".join(dict.fromkeys(names))
+
+
+@dataclass
+class _WindowGroup:
+    keys: list[exp.Expression]
+    texts: set[str]
+    windows: list[exp.Window]
 
 
 class _Planner:
@@ -390,6 +535,9 @@ class _Planner:
             return node
 
         return self._describe(tree.transform(inline, copy=True))
+
+    def describe_pipe(self, pipe: _Pipe) -> list[tuple[str, str]]:
+        return self.describe(pipe.leaves()[0].select())
 
     def stand_ins(self, select: exp.Select) -> tuple[list[tuple[str, str]], dict[str, str]]:
         """(columns as written to parquet, {name: type to cast back to})."""
@@ -453,30 +601,39 @@ class _Planner:
         sink: str,
         partitions: int,
         notes: Sequence[str],
+        sample: tuple[str, ...] = (),
     ) -> Stage:
         """Make `tree` -- `pipe`'s work, ready to write -- a stage of its own."""
+        assert not pipe.branches
         sql, parameter = self.render(tree, pipe.scan)
         for item in pipe.inputs:
             if sql.count(item.token) != 1:  # pragma: no cover - one FROM reads each input
                 raise _Refused(f"a stage does not read stage {item.stage_id} exactly once")
-        stage = Stage(
-            stage_id=len(self.stages),
-            sql=sql,
-            inputs=pipe.inputs,
-            sink=sink,
-            partitions=partitions,
-            scan=self.scans[pipe.scan] if pipe.scan else None,
-            alias=pipe.alias,
-            parameter=parameter,
-            splits=self.splits(pipe.scan) if pipe.scan else (),
-            notes=tuple(notes),
+        return self.add(
+            Stage(
+                stage_id=len(self.stages),
+                sql=sql,
+                inputs=pipe.inputs,
+                sink=sink,
+                partitions=partitions,
+                scan=self.scans[pipe.scan] if pipe.scan else None,
+                alias=pipe.alias,
+                parameter=parameter,
+                splits=self.splits(pipe.scan) if pipe.scan else (),
+                notes=tuple(notes),
+                sample_columns=sample,
+                sample_rows=self.fleet.sort_sample_rows if sample else 0,
+            )
         )
+
+    def add(self, stage: Stage) -> Stage:
+        assert stage.stage_id == len(self.stages)
         self.stages.append(stage)
         return stage
 
-    def input_pipe(
+    def reader(
         self,
-        stage: Stage,
+        stages: Sequence[Stage],
         *,
         mode: str,
         written: Sequence[tuple[str, str]],
@@ -486,28 +643,47 @@ class _Planner:
         partitions: int | None,
         hashes: tuple[Hash, ...] = (),
     ) -> _Pipe:
-        """A pipeline reading `stage`'s output, stand-in types cast back."""
-        item = StageInput(stage_id=stage.stage_id, mode=mode, empty=_empty_relation(written))
-        self.schemas[item.placeholder] = list(written)
-        table = exp.Table(this=exp.to_identifier(item.placeholder, quoted=True))
-        body: exp.Expression = table
-        if restore:
-            body = exp.select(
-                *[
-                    _alias(cast_to(exp.column(name, quoted=True), restore[name]), name)
-                    if name in restore
-                    else exp.column(name, quoted=True)
-                    for name, _ in written
-                ]
-            ).from_(table)
+        """A pipeline reading the output of `stages` (UNION ALL of them), stand-ins cast back."""
+        items = [
+            StageInput(stage_id=s.stage_id, mode=mode, empty=_empty_relation(written))
+            for s in stages
+        ]
+        selects = []
+        for item in items:
+            self.schemas[item.placeholder] = list(written)
+            table = exp.Table(this=exp.to_identifier(item.placeholder, quoted=True))
+            selects.append(
+                exp.select(
+                    *[
+                        _alias(cast_to(_column(name), restore[name]), name)
+                        if name in restore
+                        else _column(name)
+                        for name, _ in written
+                    ]
+                ).from_(table)
+            )
+        body: exp.Select = selects[0]
+        if len(selects) > 1:
+            union: exp.Expression = selects[0]
+            for other in selects[1:]:
+                union = exp.union(union, other, distinct=False)
+            body = exp.select(*[_column(name) for name, _ in written]).from_(
+                exp.Subquery(this=union, alias=_quoted_alias(self.fresh("__icefleet_u")))
+            )
         return _Pipe(
             body=body,
             columns=columns,
             parts=partitions,
-            inputs=(item,),
+            inputs=tuple(items),
             hashes=hashes,
             estimate=estimate,
         )
+
+    def written_of(self, pipe: _Pipe) -> tuple[list[tuple[str, str]], dict[str, str]]:
+        probe = exp.select(*[_column(c) for c in pipe.columns]).from_(
+            pipe.leaves()[0].relation("__icefleet_s")
+        )
+        return self.stand_ins(probe)
 
     def shuffle(
         self,
@@ -518,29 +694,31 @@ class _Planner:
         *,
         label: str | None = None,
     ) -> _Pipe:
-        """Close `side` with a shuffle by `keys` (over its columns); read it per partition."""
-        relation = side.relation("__icefleet_s")
-        probe = exp.select(*[exp.column(c, quoted=True) for c in side.columns]).from_(relation)
-        written, restore = self.stand_ins(probe)
-        projection: list[exp.Expression] = [
-            _alias(cast_to(exp.column(name, quoted=True), kind), name)
-            if name in restore
-            else exp.column(name, quoted=True)
-            for name, kind in written
-        ]
-        if n > 1:
-            projection.append(
-                _alias(partition_expression(keys, n, hash_as=hash_as), PARTITION_COLUMN)
-            )
-        tree = exp.select(*projection).from_(relation.copy())
+        """Close `side` (each branch) with a shuffle by `keys` over its columns; read it
+        back per partition."""
+        written, restore = self.written_of(side)
         label = label or ", ".join(_short(k) for k in keys)
         note = f"-> shuffle hash({label}) x {n}" if n > 1 else "-> shuffle to one partition"
-        stage = self.close(tree, side, sink="shuffle", partitions=n, notes=(*side.notes, note))
+        stages = []
+        for leaf in side.leaves():
+            relation = leaf.relation("__icefleet_s")
+            projection: list[exp.Expression] = [
+                _alias(cast_to(_column(name), kind), name) if name in restore else _column(name)
+                for name, kind in written
+            ]
+            if n > 1:
+                projection.append(
+                    _alias(partition_expression(keys, n, hash_as=hash_as), PARTITION_COLUMN)
+                )
+            tree = exp.select(*projection).from_(relation)
+            stages.append(
+                self.close(tree, leaf, sink="shuffle", partitions=n, notes=(*leaf.notes, note))
+            )
         hashes: tuple[Hash, ...] = ()
         if n > 1 and all(isinstance(k, exp.Column) for k in keys):
             hashes = (Hash(tuple(k.name for k in keys), tuple(hash_as), n),)
-        return self.input_pipe(
-            stage,
+        return self.reader(
+            stages,
             mode="partition",
             written=written,
             restore=restore,
@@ -550,23 +728,23 @@ class _Planner:
             hashes=hashes,
         )
 
-    def broadcast(self, side: _Pipe) -> tuple[Stage, _Pipe]:
+    def broadcast(self, side: _Pipe) -> tuple[list[Stage], _Pipe]:
         """Close `side` into result files that every task of the other side reads whole."""
-        relation = side.relation("__icefleet_b")
-        probe = exp.select(*[exp.column(c, quoted=True) for c in side.columns]).from_(relation)
-        written, restore = self.stand_ins(probe)
-        projection = [
-            _alias(cast_to(exp.column(name, quoted=True), kind), name)
-            if name in restore
-            else exp.column(name, quoted=True)
-            for name, kind in written
-        ]
-        tree = exp.select(*projection).from_(relation.copy())
-        stage = self.close(
-            tree, side, sink="result", partitions=1, notes=(*side.notes, "-> broadcast")
-        )
-        return stage, self.input_pipe(
-            stage,
+        written, restore = self.written_of(side)
+        stages = []
+        for leaf in side.leaves():
+            projection = [
+                _alias(cast_to(_column(name), kind), name) if name in restore else _column(name)
+                for name, kind in written
+            ]
+            tree = exp.select(*projection).from_(leaf.relation("__icefleet_b"))
+            stages.append(
+                self.close(
+                    tree, leaf, sink="result", partitions=1, notes=(*leaf.notes, "-> broadcast")
+                )
+            )
+        return stages, self.reader(
+            stages,
             mode="all",
             written=written,
             restore=restore,
@@ -574,6 +752,42 @@ class _Planner:
             estimate=side.estimate,
             partitions=None,
         )
+
+    # -- UNION ALL pipelines -------------------------------------------------------------
+
+    def union(self, pipes: Sequence[_Pipe]) -> _Pipe:
+        leaves = tuple(leaf for pipe in pipes for leaf in pipe.leaves())
+        if len(leaves) == 1:
+            return leaves[0]
+        estimates = [leaf.estimate for leaf in leaves]
+        return _Pipe(
+            body=leaves[0].body,
+            columns=leaves[0].columns,
+            estimate=None if any(e is None for e in estimates) else sum(e or 0 for e in estimates),
+            branches=leaves,
+        )
+
+    def each(self, pipe: _Pipe, step: Callable[[_Pipe], _Pipe]) -> _Pipe:
+        """`step` on every branch of a UNION ALL pipeline, or on the pipeline."""
+        if pipe.branches:
+            return self.union([step(leaf) for leaf in pipe.branches])
+        return step(pipe)
+
+    def conform(self, pipe: _Pipe, result: Sequence[tuple[str, str]]) -> _Pipe:
+        """Every branch as the set operation's result: its names, its types, by position."""
+
+        def step(leaf: _Pipe) -> _Pipe:
+            types = self.describe(leaf.select())
+            if len(types) != len(result):  # pragma: no cover - the binder already refused it
+                raise _Refused("set operation branches of different widths")
+            projection = [
+                _alias(cast_to(_column(own), kind) if own_kind != kind else _column(own), name)
+                for (own, own_kind), (name, kind) in zip(types, result, strict=True)
+            ]
+            select = exp.select(*projection).from_(leaf.relation(self.fresh("__icefleet_c")))
+            return replace(leaf, body=select, columns=tuple(n for n, _ in result), hashes=())
+
+        return self.each(pipe, step)
 
     # -- the tree ----------------------------------------------------------------------
 
@@ -592,26 +806,38 @@ class _Planner:
             return self.project(node)
         if isinstance(node, Aggregate):
             return self.aggregate(node)
-        return self.join(node)
+        if isinstance(node, Join):
+            return self.join(node)
+        if isinstance(node, Window):
+            return self.window(node)
+        if isinstance(node, DistinctOn):
+            return self.distinct_on(node)
+        if isinstance(node, TopN):
+            return self.top_n(node)
+        return self.setop(node)
 
     def project(self, node: Project) -> _Pipe:
         child = self.plan(node.child)
         alias = relation_alias(from_of(node.select))  # type: ignore[arg-type]
-        select = node.select.copy()
-        set_from(select, child.relation(alias))
-        names = _projected(select, alias)
-        return replace(
-            child,
-            body=select,
-            columns=tuple(p.alias_or_name for p in select.expressions),
-            hashes=_renamed_hashes(child.hashes, names),
-        )
+
+        def step(leaf: _Pipe) -> _Pipe:
+            select = node.select.copy()
+            set_from(select, leaf.relation(alias))
+            return replace(
+                leaf,
+                body=select,
+                columns=tuple(p.alias_or_name for p in select.expressions),
+                hashes=_renamed_hashes(leaf.hashes, _projected(select, alias)),
+            )
+
+        return self.each(child, step)
 
     def aggregate(self, node: Aggregate) -> _Pipe:
         child = self.plan(node.child)
         alias = relation_alias(from_of(node.select))  # type: ignore[arg-type]
+        leaves = child.leaves()
         work = node.select.copy()
-        set_from(work, child.relation(alias))
+        set_from(work, leaves[0].relation(alias))
         keys = group_keys(work)
         if isinstance(keys, Uncuttable):
             raise _Refused(keys.reason)
@@ -623,7 +849,12 @@ class _Planner:
         key_columns = {
             k.name for k in keys if isinstance(k, exp.Column) and (not k.table or k.table == alias)
         }
-        if keys and child.parts is not None:
+        if (
+            keys
+            and child.parts is not None
+            and not child.branches
+            and grouping_sets_of(work) is None
+        ):
             for known in child.hashes:
                 if known.partitions == child.parts and set(known.columns) <= key_columns:
                     note = (
@@ -651,26 +882,35 @@ class _Planner:
             work_note = f"partial: {', '.join(cut.partials) or 'distinct keys'}{grouping}"
         else:
             work_note = f"raw rows, no partial aggregate ({cut.why_raw}){grouping}"
+        if cut.grouping_sets:
+            work_note += f" · {cut.grouping_sets} grouping sets, one shuffle"
         shuffle_note = (
             f"-> shuffle hash({label}) x {cut.partitions}"
             if cut.partitions > 1
             else "-> shuffle to one partition"
         )
-        stage = self.close(
-            cut.partial,
-            child,
-            sink="shuffle",
-            partitions=cut.partitions,
-            notes=(*child.notes, work_note, shuffle_note),
-        )
-        item = StageInput(
-            stage_id=stage.stage_id, mode="partition", empty=_empty_relation(cut.shuffle_columns)
-        )
-        self.schemas[item.placeholder] = list(cut.shuffle_columns)
-        final = cut.final.copy()
-        for table in final.find_all(exp.Table):
-            if table.name == INPUT_TABLE:
-                table.set("this", exp.to_identifier(item.placeholder, quoted=True))
+        stages = []
+        for leaf in leaves:
+            partial = cut.partial.copy()
+            set_from(partial, leaf.relation(alias))
+            stages.append(
+                self.close(
+                    partial,
+                    leaf,
+                    sink="shuffle",
+                    partitions=cut.partitions,
+                    notes=(*leaf.notes, work_note, shuffle_note),
+                )
+            )
+        items = [
+            StageInput(
+                stage_id=s.stage_id, mode="partition", empty=_empty_relation(cut.shuffle_columns)
+            )
+            for s in stages
+        ]
+        for item in items:
+            self.schemas[item.placeholder] = list(cut.shuffle_columns)
+        final = _bind_input(cut.final.copy(), items, self.fresh("__icefleet_u"))
 
         if cut.strategy == "partial" and cut.finals:
             combined = f"final: {', '.join(cut.finals)}"
@@ -687,8 +927,10 @@ class _Planner:
             body=final,
             columns=columns,
             parts=cut.partitions,
-            inputs=(item,),
-            hashes=self.final_hashes(final, keys, cut.strategy, cut.partitions),
+            inputs=tuple(items),
+            hashes=()
+            if cut.grouping_sets
+            else self.final_hashes(final, keys, cut.strategy, cut.partitions),
             estimate=child.estimate if keys else 0,
             notes=(f"{combined}{grouping} · {spread}",),
         )
@@ -701,26 +943,272 @@ class _Planner:
             return ()
         names: list[str] = []
         for index, key in enumerate(keys):
-            target = exp.column(f"__k{index}", quoted=True) if strategy == "partial" else key
-            found = next(
-                (
-                    p.alias_or_name
-                    for p in final.expressions
-                    if p.unalias() == target
-                    or (
-                        strategy == "partial"
-                        and isinstance(p.unalias(), exp.Column)
-                        and p.unalias().name == f"__k{index}"
-                        and not p.unalias().table
+            found = None
+            for projection in final.expressions:
+                target = projection.unalias()
+                if strategy == "partial":
+                    hit = (
+                        isinstance(target, exp.Column)
+                        and target.name == f"__k{index}"
+                        and not target.table
                     )
-                ),
-                None,
-            )
+                else:
+                    hit = target == key
+                if hit:
+                    found = projection.alias_or_name
+                    break
             if found is None:
                 return ()
             names.append(found)
         types = dict(self.describe(final))
         return (Hash(tuple(names), tuple(hash_type(types[name]) for name in names), n),)
+
+    # -- co-location: windows, DISTINCT ON ---------------------------------------------
+
+    def narrow(self, child: _Pipe, alias: str, select: exp.Select) -> _Pipe:
+        """`child` cut to the columns `select` reads from it, with `select`'s WHERE (rows
+        are filtered before they move; a window or DISTINCT ON sees them filtered)."""
+        names = _columns_of(select, alias)
+        where = select.args.get("where")
+
+        def step(leaf: _Pipe) -> _Pipe:
+            projection = [_alias(_column(name, alias), name) for name in names] or [
+                _alias(exp.true(), self.fresh("__icefleet_row"))
+            ]
+            side = exp.select(*projection)
+            set_from(side, leaf.relation(alias))
+            if where is not None:
+                side.set("where", where.copy())
+            return replace(
+                leaf,
+                body=side,
+                columns=tuple(p.alias_or_name for p in projection),
+                hashes=_renamed_hashes(leaf.hashes, {n: n for n in names}),
+            )
+
+        return self.each(child, step)
+
+    def colocate(
+        self, pipe: _Pipe, keys: Sequence[exp.Expression], alias: str, what: str
+    ) -> tuple[_Pipe, str]:
+        """`pipe` with rows of equal `keys` (over `alias`'s columns) in one partition; no
+        keys: one partition. Returns the pipeline and what explain() says about it."""
+        plain = [_unqualified(k, alias) for k in keys]
+        if not keys:
+            if pipe.parts == 1 and not pipe.branches:
+                return pipe, f"{what} · one partition"
+            shuffled = self.shuffle(pipe, [], [], 1)
+            return (
+                shuffled,
+                f"{what} · no PARTITION BY: one partition, the whole input in one task "
+                "(decision 18)",
+            )
+        columns = {k.name for k in plain if isinstance(k, exp.Column)}
+        if pipe.parts is not None and not pipe.branches:
+            for known in pipe.hashes:
+                if known.partitions == pipe.parts and set(known.columns) <= columns:
+                    return pipe, (
+                        f"{what} · partition by {', '.join(_short(k) for k in keys)} "
+                        f"(rows already partitioned by hash({', '.join(known.columns)}))"
+                    )
+        types = self.key_types(pipe, plain)
+        n = self.fleet.shuffle_partitions
+        shuffled = self.shuffle(
+            pipe, plain, [hash_type(t) for t in types], n, label=", ".join(_short(k) for k in keys)
+        )
+        return (
+            shuffled,
+            f"{what} · partition by {', '.join(_short(k) for k in keys)} · {n} partitions",
+        )
+
+    def window(self, node: Window) -> _Pipe:
+        child = self.plan(node.child)
+        alias = relation_alias(from_of(node.select))  # type: ignore[arg-type]
+        work = node.select.copy()
+        windows = windows_of(work)
+        qualify = work.args.get("qualify")
+        in_qualify = {id(w) for w in qualify.find_all(exp.Window)} if qualify is not None else set()
+
+        # Group the windows: one shuffle by the keys they all share, else one per group.
+        groups: list[_WindowGroup] = []
+        for window in windows:
+            keys = list(window.args.get("partition_by") or [])
+            texts = {k.sql(dialect="duckdb") for k in keys}
+            for group in groups:
+                if (group.texts and texts and group.texts & texts) or (
+                    not group.texts and not texts
+                ):
+                    group.texts &= texts
+                    group.keys = [k for k in group.keys if k.sql(dialect="duckdb") in group.texts]
+                    group.windows.append(window)
+                    break
+            else:
+                groups.append(
+                    _WindowGroup(keys=[k.copy() for k in keys], texts=texts, windows=[window])
+                )
+        # QUALIFY needs a window of its own in the last SELECT: its group goes last.
+        groups.sort(key=lambda g: any(id(w) in in_qualify for w in g.windows))
+
+        pipe = self.narrow(child, alias, work)
+        notes: list[str] = []
+        for group in groups[:-1]:
+            pipe, note = self.colocate(
+                pipe, group.keys, alias, f"window: {_function_names(group.windows)}"
+            )
+            computed: list[tuple[exp.Window, str]] = [
+                (w, self.fresh("__icefleet_w")) for w in group.windows
+            ]
+
+            def step(
+                leaf: _Pipe, computed: list[tuple[exp.Window, str]] = computed, note: str = note
+            ) -> _Pipe:
+                select = exp.select(
+                    *[_column(c, alias) for c in leaf.columns],
+                    *[_alias(w.copy(), name) for w, name in computed],
+                )
+                set_from(select, leaf.relation(alias))
+                return replace(
+                    leaf,
+                    body=select,
+                    columns=(*leaf.columns, *[name for _, name in computed]),
+                    notes=(*leaf.notes, note),
+                )
+
+            pipe = self.each(pipe, step)
+            for window, name in computed:
+                window.replace(_column(name, alias))
+            notes.append(note)
+        last = groups[-1]
+        pipe, note = self.colocate(
+            pipe, last.keys, alias, f"window: {_function_names(last.windows)}"
+        )
+        work.set("where", None)
+        set_from(work, pipe.relation(alias))
+        columns = tuple(p.alias_or_name for p in work.expressions)
+        return replace(
+            pipe,
+            body=work,
+            columns=columns,
+            hashes=_renamed_hashes(pipe.hashes, _projected(work, alias)),
+            estimate=child.estimate,
+            notes=(*pipe.notes, note),
+        )
+
+    def distinct_on(self, node: DistinctOn) -> _Pipe:
+        child = self.plan(node.child)
+        alias = relation_alias(from_of(node.select))  # type: ignore[arg-type]
+        work = node.select.copy()
+        on = work.args["distinct"].args["on"]
+        keys = list(on.expressions) if isinstance(on, exp.Tuple) else [on]
+        pipe = self.narrow(child, alias, work)
+        pipe, note = self.colocate(pipe, keys, alias, "distinct on")
+        work.set("where", None)
+        set_from(work, pipe.relation(alias))
+        return replace(
+            pipe,
+            body=work,
+            columns=tuple(p.alias_or_name for p in work.expressions),
+            hashes=_renamed_hashes(pipe.hashes, _projected(work, alias)),
+            estimate=child.estimate,
+            notes=(*pipe.notes, note),
+        )
+
+    def top_n(self, node: TopN) -> _Pipe:
+        child = self.plan(node.child)
+        order = [item.copy() for item in node.order]
+        keep = None if node.limit is None else node.limit + node.offset
+        what = (
+            f"top {node.limit}"
+            if node.order and node.limit is not None
+            else f"first {node.limit}"
+            if node.limit is not None
+            else "everything"
+        )
+        if node.offset:
+            what += f" after {node.offset}"
+
+        def final_over(pipe: _Pipe) -> exp.Select:
+            select = exp.select(*[_column(c) for c in node.columns]).from_(
+                pipe.relation(self.fresh("__icefleet_t"))
+            )
+            if order:
+                select = select.order_by(*[item.copy() for item in order])
+            if node.limit is not None:
+                select = select.limit(node.limit)
+            if node.offset:
+                select = select.offset(node.offset)
+            return select
+
+        if child.parts == 1 and not child.branches:  # already in one partition
+            return replace(
+                child,
+                body=final_over(child),
+                columns=node.columns,
+                hashes=(),
+                notes=(*child.notes, f"{what}, in place"),
+            )
+
+        def local(leaf: _Pipe) -> _Pipe:
+            if keep is None:
+                return leaf
+            select = exp.select(*[_column(c) for c in leaf.columns]).from_(
+                leaf.relation(self.fresh("__icefleet_t"))
+            )
+            if order:
+                select = select.order_by(*[item.copy() for item in order])
+            select = select.limit(keep)
+            return replace(
+                leaf,
+                body=select,
+                notes=(*leaf.notes, f"{'top' if order else 'first'} {keep} per task"),
+            )
+
+        gathered = self.shuffle(self.each(child, local), [], [], 1)
+        return replace(
+            gathered,
+            body=final_over(gathered),
+            columns=node.columns,
+            hashes=(),
+            estimate=child.estimate,
+            notes=(f"{what} · one partition",),
+        )
+
+    def setop(self, node: SetOp) -> _Pipe:
+        result = self.describe(node.node)
+        left = self.conform(self.plan(node.left), result)
+        right = self.conform(self.plan(node.right), result)
+        if node.kind == "union" and not node.distinct:
+            return self.union([left, right])
+        names = [name for name, _ in result]
+        types = [hash_type(kind) for _, kind in result]
+        n = self.fleet.shuffle_partitions
+        keys = [_column(name) for name in names]
+        label = "every column"
+        left = self.shuffle(left, keys, types, n, label=label)
+        right = self.shuffle(right, keys, types, n, label=label)
+        operation: type[exp.SetOperation] = {
+            "union": exp.Union,
+            "intersect": exp.Intersect,
+            "except": exp.Except,
+        }[node.kind]
+        combined = operation(
+            this=left.select().copy(), expression=right.select().copy(), distinct=node.distinct
+        )
+        body = exp.select(*[_column(name) for name in names]).from_(
+            exp.Subquery(this=combined, alias=_quoted_alias(self.fresh("__icefleet_x")))
+        )
+        word = f"{node.kind}{'' if node.distinct else ' all'}"
+        return _Pipe(
+            body=body,
+            columns=tuple(names),
+            parts=n,
+            inputs=left.inputs + right.inputs,
+            hashes=(Hash(tuple(names), tuple(types), n),),
+            estimate=None
+            if left.estimate is None or right.estimate is None
+            else left.estimate + right.estimate,
+            notes=(f"{word} · per partition of hash(every column) x {n}",),
+        )
 
     # -- joins ---------------------------------------------------------------------------
 
@@ -763,7 +1251,7 @@ class _Planner:
         def rewrite(expression: exp.Expression) -> exp.Expression:
             def swap(n: exp.Expression) -> exp.Expression:
                 if isinstance(n, exp.Column) and (n.table, n.name) in colmap:
-                    return exp.column(colmap[(n.table, n.name)], quoted=True)
+                    return _column(colmap[(n.table, n.name)])
                 return n
 
             return expression.transform(swap, copy=True)
@@ -791,23 +1279,28 @@ class _Planner:
         for child, alias in zip(node.children, aliases, strict=True):
             fragment = self.plan(child)
             projection = [
-                _alias(exp.column(name, table=alias, quoted=True), colmap[(alias, name)])
-                for name in needed[alias]
+                _alias(_column(name, alias), colmap[(alias, name)]) for name in needed[alias]
             ] or [_alias(exp.true(), self.fresh("__icefleet_row"))]
-            side = exp.select(*projection)
-            set_from(side, fragment.relation(alias))
-            if pushed[alias]:
-                side.set("where", exp.Where(this=exp.and_(*pushed[alias])))
-            sides.append(
-                replace(
-                    fragment,
+
+            def step(
+                leaf: _Pipe,
+                alias: str = alias,
+                projection: list[exp.Alias] = projection,
+            ) -> _Pipe:
+                side = exp.select(*[p.copy() for p in projection])
+                set_from(side, leaf.relation(alias))
+                if pushed[alias]:
+                    side.set("where", exp.Where(this=exp.and_(*[c.copy() for c in pushed[alias]])))
+                return replace(
+                    leaf,
                     body=side,
                     columns=tuple(p.alias_or_name for p in projection),
                     hashes=_renamed_hashes(
-                        fragment.hashes, {name: colmap[(alias, name)] for name in needed[alias]}
+                        leaf.hashes, {name: colmap[(alias, name)] for name in needed[alias]}
                     ),
                 )
-            )
+
+            sides.append(self.each(fragment, step))
 
         acc = sides[0]
         for index, (join, kind) in enumerate(zip(joins, kinds, strict=True), start=1):
@@ -824,17 +1317,20 @@ class _Planner:
                 label=on.sql(dialect="duckdb") if on is not None else "every pair of rows",
             )
 
-        top = exp.select(*[rewrite(p) for p in select.expressions])
-        set_from(top, acc.relation(self.fresh("__icefleet_j")))
-        if where is not None:
-            top.set("where", exp.Where(this=rewrite(where.this)))
-        return replace(
-            acc,
-            body=top,
-            columns=tuple(p.alias_or_name for p in top.expressions),
-            hashes=_renamed_hashes(acc.hashes, _projected(top, None)),
-            estimate=None,
-        )
+        def top_of(leaf: _Pipe) -> _Pipe:
+            top = exp.select(*[rewrite(p) for p in select.expressions])
+            set_from(top, leaf.relation(self.fresh("__icefleet_j")))
+            if where is not None:
+                top.set("where", exp.Where(this=rewrite(where.this)))
+            return replace(
+                leaf,
+                body=top,
+                columns=tuple(p.alias_or_name for p in top.expressions),
+                hashes=_renamed_hashes(leaf.hashes, _projected(top, None)),
+                estimate=None,
+            )
+
+        return self.each(acc, top_of)
 
     def join_two(
         self,
@@ -862,20 +1358,17 @@ class _Planner:
         if small:
             order = BROADCASTABLE[kind]
             chosen = min(small, key=lambda name: (sides[name].estimate or 0, order.index(name)))
-            stage, built = self.broadcast(sides[chosen])
+            stages, built = self.broadcast(sides[chosen])
             if chosen == "left":
                 left, right, probe = built, right, right
             else:
                 left, right, probe = left, built, left
             note = (
                 f"join: {kind}, broadcast hash join · the {chosen} side from stage "
-                f"{stage.stage_id} ({format_bytes(sides[chosen].estimate or 0)} est.) · on {label}"
+                f"{', '.join(str(s.stage_id) for s in stages)} "
+                f"({format_bytes(sides[chosen].estimate or 0)} est.) · on {label}"
             )
-            return replace(
-                self.combine(left, right, node, kind, on),
-                hashes=probe.hashes,
-                notes=(*left.notes, *right.notes, note),
-            )
+            return self.combine(left, right, node, kind, on, hashes=probe.hashes, note=note)
 
         if not keys:
             raise _Refused(
@@ -897,7 +1390,7 @@ class _Planner:
 
         def reusable(side: _Pipe, cols: Sequence[str | None]) -> tuple[int, ...] | None:
             """The key positions `side` is already hash-partitioned by, if any."""
-            if side.parts != n:
+            if side.parts != n or side.branches:
                 return None
             for item in side.hashes:
                 if item.partitions != n:
@@ -919,48 +1412,32 @@ class _Planner:
                     return tuple(positions)
             return None
 
+        def shuffled(side: _Pipe, which: int, positions: Sequence[int]) -> _Pipe:
+            return self.shuffle(
+                side,
+                [keys[i][which] for i in positions],
+                [hash_as[i] for i in positions],
+                n,
+                label=", ".join(shown[i][which] for i in positions),
+            )
+
         reuse_left, reuse_right = reusable(left, left_cols), reusable(right, right_cols)
         reused = ""
         if reuse_left is not None and reuse_right is not None and reuse_left == reuse_right:
-            positions = reuse_left
+            positions: tuple[int, ...] = reuse_left
             reused = " · both sides already partitioned by the keys"
         elif reuse_left is not None:
             positions = reuse_left
-            right = self.shuffle(
-                right,
-                [keys[i][1] for i in positions],
-                [hash_as[i] for i in positions],
-                n,
-                label=", ".join(shown[i][1] for i in positions),
-            )
+            right = shuffled(right, 1, positions)
             reused = " · the left side already partitioned by the keys"
         elif reuse_right is not None:
             positions = reuse_right
-            left = self.shuffle(
-                left,
-                [keys[i][0] for i in positions],
-                [hash_as[i] for i in positions],
-                n,
-                label=", ".join(shown[i][0] for i in positions),
-            )
+            left = shuffled(left, 0, positions)
             reused = " · the right side already partitioned by the keys"
         else:
             positions = tuple(range(len(keys)))
-            types = [hash_as[i] for i in positions]
-            left = self.shuffle(
-                left,
-                [keys[i][0] for i in positions],
-                types,
-                n,
-                label=", ".join(shown[i][0] for i in positions),
-            )
-            right = self.shuffle(
-                right,
-                [keys[i][1] for i in positions],
-                types,
-                n,
-                label=", ".join(shown[i][1] for i in positions),
-            )
+            left = shuffled(left, 0, positions)
+            right = shuffled(right, 1, positions)
 
         hashed = tuple(hash_as[i] for i in positions)
         by_left = _hash_over(left_cols, positions, hashed, n)
@@ -974,22 +1451,41 @@ class _Planner:
             "full": (),
         }[kind]
         note = f"join: {kind}, shuffle hash join · on {label} · {n} partitions{reused}"
-        return replace(
-            self.combine(left, right, node, kind, on),
-            hashes=hashes,
-            notes=(*left.notes, *right.notes, note),
-        )
+        return self.combine(left, right, node, kind, on, hashes=hashes, note=note)
 
     def key_types(self, side: _Pipe, keys: Sequence[exp.Expression]) -> list[str]:
         probe = exp.select(*[_alias(k.copy(), f"__key{i}") for i, k in enumerate(keys)]).from_(
-            side.relation("__icefleet_k")
+            side.leaves()[0].relation("__icefleet_k")
         )
         return [kind for _, kind in self.describe(probe)]
 
     def combine(
-        self, left: _Pipe, right: _Pipe, node: exp.Join, kind: str, on: exp.Expression | None
+        self,
+        left: _Pipe,
+        right: _Pipe,
+        node: exp.Join,
+        kind: str,
+        on: exp.Expression | None,
+        *,
+        hashes: tuple[Hash, ...],
+        note: str,
     ) -> _Pipe:
-        """`left JOIN right ON on` as one pipeline; both sides must run in the same tasks."""
+        """`left JOIN right ON on` as one pipeline per branch of a UNION ALL probe side;
+        both sides must run in the same tasks."""
+        if left.branches:
+            return self.union(
+                [
+                    self.combine(b, right, node, kind, on, hashes=(), note=note)
+                    for b in left.branches
+                ]
+            )
+        if right.branches:
+            return self.union(
+                [
+                    self.combine(left, b, node, kind, on, hashes=(), note=note)
+                    for b in right.branches
+                ]
+            )
         if left.scan and right.scan:  # pragma: no cover - one side is always closed first
             raise _Refused("both sides of a join would read a table in one stage")
         if (left.scan or right.scan) and (left.parts or right.parts):  # pragma: no cover
@@ -1000,7 +1496,7 @@ class _Planner:
         join.set("this", right.relation(self.fresh("__icefleet_r")))
         join.set("on", on.copy() if on is not None else None)
         columns = left.columns + (() if kind in ("semi", "anti") else right.columns)
-        select = exp.select(*[exp.column(c, quoted=True) for c in columns])
+        select = exp.select(*[_column(c) for c in columns])
         set_from(select, left.relation(self.fresh("__icefleet_l")))
         select.append("joins", join)
         driver = left if (left.scan or left.parts) else right
@@ -1011,8 +1507,37 @@ class _Planner:
             alias=driver.alias,
             parts=left.parts or right.parts,
             inputs=left.inputs + right.inputs,
+            hashes=hashes,
             estimate=None,
+            notes=(*left.notes, *right.notes, note),
         )
+
+
+def _bind_input(final: exp.Select, items: Sequence[StageInput], alias: str) -> exp.Select:
+    """Point a final aggregate's input table at its stage input(s) -- a UNION ALL of
+    several, one per branch, when the aggregate's input was one."""
+    for table in list(final.find_all(exp.Table)):
+        if table.name != INPUT_TABLE:
+            continue
+        if len(items) == 1:
+            table.set("this", exp.to_identifier(items[0].placeholder, quoted=True))
+            continue
+        union: exp.Expression = exp.select("*").from_(
+            exp.Table(this=exp.to_identifier(items[0].placeholder, quoted=True))
+        )
+        for item in items[1:]:
+            union = exp.union(
+                union,
+                exp.select("*").from_(
+                    exp.Table(this=exp.to_identifier(item.placeholder, quoted=True))
+                ),
+                distinct=False,
+            )
+        own = table.args.get("alias")
+        table.replace(
+            exp.Subquery(this=union, alias=own.copy() if own is not None else _quoted_alias(alias))
+        )
+    return final
 
 
 # -- the entry point -----------------------------------------------------------------------
@@ -1101,34 +1626,107 @@ def _plan(planner: _Planner, query: Query, output_names: list[str]) -> StagePlan
     restore = {name: kind for name, kind in result[: len(output_names)] if stand_in[name] != kind}
 
     root = planner.plan(query.root)
-    tree = root.select()
-    # The result as written: stand-in casts, then each task's own top-n / first-n.
-    if any(stand_in[name] != kind for name, kind in result):
-        tree = exp.select(
-            *[
-                _alias(cast_to(exp.column(name, quoted=True), stand_in[name]), name)
-                if stand_in[name] != kind
-                else exp.column(name, quoted=True)
-                for name, kind in result
-            ]
-        ).from_(tree.subquery("__icefleet_out"))
-    if query.limit is not None:
-        top = exp.select("*").from_(tree.subquery("__icefleet_top"))
-        if query.order:
-            top = top.order_by(*[item.copy() for item in query.order])
-        tree = top.limit(query.limit)
-    per_task = (
-        ""
-        if query.limit is None
-        else f" · {'top' if query.order else 'first'} {query.limit} per task"
+    fleet = planner.fleet
+    keys = sort_keys(query.order, stand_in) if query.order else ()
+    ranged = (
+        bool(query.order)
+        and query.limit is None
+        and (root.estimate is None or root.estimate > fleet.sort_coordinator_bytes)
+        and sortable_by_range(keys)
     )
-    planner.close(
-        tree, root, sink="result", partitions=1, notes=(*root.notes, f"-> result{per_task}")
+    keep = None if query.limit is None else query.limit + query.offset
+    per_task = "" if keep is None else f" · {'top' if query.order else 'first'} {keep} per task"
+
+    def written(leaf: _Pipe) -> exp.Select:
+        """The result as written: stand-in casts, then each task's own top-n / first-n."""
+        tree = leaf.select()
+        if any(stand_in[name] != kind for name, kind in result):
+            tree = exp.select(
+                *[
+                    _alias(cast_to(_column(name), stand_in[name]), name)
+                    if stand_in[name] != kind
+                    else _column(name)
+                    for name, kind in result
+                ]
+            ).from_(tree.subquery("__icefleet_out"))
+        if keep is not None:
+            top = exp.select("*").from_(tree.subquery("__icefleet_top"))
+            if query.order:
+                top = top.order_by(*[item.copy() for item in query.order])
+            tree = top.limit(keep)
+        return tree
+
+    sample = tuple(key.column for key in keys) if ranged else ()
+    sink_note = "-> result, with a sample of the sort keys" if ranged else f"-> result{per_task}"
+    finals = [
+        planner.close(
+            written(leaf),
+            leaf,
+            sink="result",
+            partitions=1,
+            notes=(*leaf.notes, sink_note),
+            sample=sample,
+        )
+        for leaf in root.leaves()
+    ]
+    order = tuple(item.sql(dialect="duckdb") for item in query.order)
+    if not ranged:
+        return StagePlan(
+            stages=tuple(planner.stages),
+            columns=tuple(output_names),
+            restore=restore,
+            order=order,
+            limit=query.limit,
+            offset=query.offset,
+            final_stages=tuple(s.stage_id for s in finals),
+        )
+
+    # The range sort: partition every row by the sampled boundaries, then sort each part.
+    n = fleet.shuffle_partitions
+    columns = [(name, stand_in[name]) for name, _ in result]
+    spec = RangeSpec(keys=keys, partitions=n, sample_stages=tuple(s.stage_id for s in finals))
+    items = [
+        StageInput(stage_id=s.stage_id, mode="task", empty=_empty_relation(columns)) for s in finals
+    ]
+    listing = ", ".join(_quote(name) for name, _ in columns)
+    inner = " UNION ALL ".join(f"SELECT {listing} FROM {item.token}" for item in items)
+    ranger = planner.add(
+        Stage(
+            stage_id=len(planner.stages),
+            sql=(
+                f'SELECT {listing}, {RANGE_TOKEN} AS "{PARTITION_COLUMN}" '
+                f'FROM ({inner}) AS "__icefleet_r"'
+            ),
+            inputs=tuple(items),
+            sink="shuffle",
+            partitions=n,
+            range=spec,
+            notes=(
+                f"range partition by {spec.order_sql()} · a task per task of stage "
+                f"{', '.join(str(s.stage_id) for s in finals)}; boundaries from their samples",
+                f"-> shuffle by range x {n}",
+            ),
+        )
+    )
+    part = StageInput(stage_id=ranger.stage_id, mode="partition", empty=_empty_relation(columns))
+    sorter = planner.add(
+        Stage(
+            stage_id=len(planner.stages),
+            sql=f"SELECT {listing} FROM {part.token} ORDER BY {spec.order_sql()}",
+            inputs=(part,),
+            sink="result",
+            partitions=1,
+            notes=(
+                f"sort: {spec.order_sql()} · a task per range partition with rows",
+                "-> result",
+            ),
+        )
     )
     return StagePlan(
         stages=tuple(planner.stages),
         columns=tuple(output_names),
         restore=restore,
-        order=tuple(item.sql(dialect="duckdb") for item in query.order),
-        limit=query.limit,
+        offset=query.offset,
+        final_stages=(sorter.stage_id,),
+        ranged=True,
     )

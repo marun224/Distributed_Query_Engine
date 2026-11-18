@@ -63,20 +63,28 @@ class SinkSpec:
     `result`: the rows as they are. `shuffle`: the stage SQL carries an `__part` column
     (`hash(keys) % partitions`) and the rows are written one directory per partition
     value; with `partitions == 1` there is no `__part` column and one directory.
+    `sample_columns` (a `result` sink feeding a range sort): a reservoir sample of
+    `sample_rows` rows of those columns is written beside the rows, as one more file.
     """
 
     kind: str
     location: str
     target_file_bytes: int = 256 * 1024**2
     partitions: int = 1
+    sample_columns: tuple[str, ...] = ()
+    sample_rows: int = 0
 
     def to_json(self) -> dict[str, Any]:
-        return {
+        out: dict[str, Any] = {
             "kind": self.kind,
             "location": self.location,
             "target_file_bytes": self.target_file_bytes,
             "partitions": self.partitions,
         }
+        if self.sample_columns:
+            out["sample_columns"] = list(self.sample_columns)
+            out["sample_rows"] = self.sample_rows
+        return out
 
     @classmethod
     def from_json(cls, data: Mapping[str, Any]) -> SinkSpec:
@@ -88,6 +96,8 @@ class SinkSpec:
             location=_require(data, "location", str),
             target_file_bytes=int(data.get("target_file_bytes", 256 * 1024**2)),
             partitions=int(data.get("partitions", 1)),
+            sample_columns=tuple(str(c) for c in data.get("sample_columns", ())),
+            sample_rows=int(data.get("sample_rows", 0)),
         )
 
 
@@ -138,17 +148,21 @@ class OutputFile:
     """One file a task wrote, as DuckDB's `RETURN_STATS` reported it.
 
     `partition` is the shuffle partition the file belongs to; None for a result file.
+    `sample` marks a range sort's key sample, which is not part of the stage's rows.
     """
 
     path: str
     bytes: int
     rows: int
     partition: int | None = None
+    sample: bool = False
 
     def to_json(self) -> dict[str, Any]:
         out: dict[str, Any] = {"path": self.path, "bytes": self.bytes, "rows": self.rows}
         if self.partition is not None:
             out["partition"] = self.partition
+        if self.sample:
+            out["sample"] = True
         return out
 
     @classmethod
@@ -163,6 +177,7 @@ class OutputFile:
             bytes=_require(data, "bytes", int),
             rows=_require(data, "rows", int),
             partition=partition,
+            sample=bool(data.get("sample", False)),
         )
 
 
@@ -180,11 +195,16 @@ class TaskResult:
 
     @property
     def rows_out(self) -> int:
-        return sum(f.rows for f in self.manifest)
+        return sum(f.rows for f in self.manifest if not f.sample)
 
     @property
     def bytes_out(self) -> int:
-        return sum(f.bytes for f in self.manifest)
+        return sum(f.bytes for f in self.manifest if not f.sample)
+
+    @property
+    def data(self) -> tuple[OutputFile, ...]:
+        """The files holding the stage's rows (a range sort's sample is not one)."""
+        return tuple(f for f in self.manifest if not f.sample)
 
     def to_json(self) -> dict[str, Any]:
         return {

@@ -9,12 +9,12 @@ Update at the end of every session. Design lives in
 | | |
 |---|---|
 | Last updated | 2026-11-18 |
-| Current phase | **Phase 4 — Windows, ordering, set operations, grouping sets: kickoff** (Phase 3 confirmed 2026-11-18) |
-| Last updated (git) | 2026-11-16: Phase 1 committed (`fb937a7`) and pushed to the new **public** repo https://github.com/marun224/Distributed_Query_Engine (`origin`, `main` tracks `origin/main`). **Phase 2 committed on `main`** at the owner's request ("pls commit phase 2", 2026-11-16; `88fc616`). **Pushed:** checked 2026-11-18 with `git ls-remote`, GitHub's `main` is `88fc616`. **Phase 3 committed on `main`** at the owner's request ("pls commit pahse 3 changes", 2026-11-18; the commit after `88fc616`, see `git log`). **Not pushed** |
-| Next action | **Phase 4 kickoff questions** to the owner; then plan and build |
+| Current phase | **Phase 4 — Windows, ordering, set operations, grouping sets: built, gate green, awaiting owner confirmation** (Phase 3 confirmed 2026-11-18) |
+| Last updated (git) | 2026-11-16: Phase 1 committed (`fb937a7`) and pushed to the new **public** repo https://github.com/marun224/Distributed_Query_Engine (`origin`, `main` tracks `origin/main`). **Phase 2 committed on `main`** at the owner's request ("pls commit phase 2", 2026-11-16; `88fc616`). **Pushed:** checked 2026-11-18 with `git ls-remote`, GitHub's `main` is `88fc616`. **Phase 3 committed on `main`** at the owner's request ("pls commit pahse 3 changes", 2026-11-18; the commit after `88fc616`, see `git log`). **Not pushed.** **Phase 4 committed on `main`** at the owner's request ("pls commit phase 4 chnages to git", 2026-11-18; the commit after `0330d62`). **Not pushed** |
+| Next action | **Owner to confirm Phase 4** (and say whether to push); then the Phase 5 kickoff questions |
 | Next phase | Phase 5 — Distributed writes, one commit |
 | Blocked on | Owner confirmation only |
-| Gate | **`.\scripts\dev.ps1 uv run tox` green on 2026-11-18** (Phase 3): lint · type · py312 **508 passed** · dist, 103 s; the cluster suite then twice more in random order, 264 passed each. Proof of life `scripts/smoke_cluster.py` on the dev catalog: **OK** for all four queries (projection, aggregate, join broadcast, join shuffled). The Windows `.venv` gate is not authoritative (decision 28) |
+| Gate | **`.\scripts\dev.ps1 uv run tox` green on 2026-11-18** (Phase 4): lint · type · py312 **755 passed** · dist, 219 s (the tests alone 3 min 20 s, over plan §9's 3-minute target -- Known gaps). Proof of life `scripts/smoke_cluster.py` on the dev catalog: **OK** for all eight queries (projection, aggregate, join broadcast / shuffled, window, rollup, union, range sort). The Windows `.venv` gate is not authoritative (decision 28) |
 
 ## Phases
 
@@ -24,7 +24,7 @@ Update at the end of every session. Design lives in
 | 1 | Worker (HTTP), `local[N]`, splits, scan-only stages, fallback, proof of life on the dev catalog | **done** | 2026-11-15 | **yes, 2026-11-16** |
 | 2 | Exchange (shuffle) + two-phase aggregation + explain DAG | **done** | 2026-11-16 | **yes, 2026-11-18** |
 | 3 | Joins: broadcast and shuffle hash | **done** | 2026-11-18 | **yes, 2026-11-18** |
-| 4 | Windows, distributed ORDER BY (range partitioning), OFFSET, set operations, grouping sets | **in progress — kickoff** | — | — |
+| 4 | Windows, distributed ORDER BY (range partitioning), OFFSET, set operations, grouping sets | **built — awaiting confirmation** | 2026-11-18 | pending |
 | 5 | Distributed writes, one commit; 5b row-level operations | not started | — | — |
 | 6 | Container image, Kubernetes manifests, Argo fleet-per-workflow, integration tier, benchmarks (decision 27) | not started | — | — |
 | 6b | Argo as a scheduler backend: pod per task (`ArgoScheduler`, `icefleet-worker run-task`) | not started | — | — |
@@ -101,6 +101,22 @@ Update at the end of every session. Design lives in
 | 3.11 | Docs: plan v1.5 (§4.1, §4.3, §4.4, §5, §6 "As built"), `divergence.md`, README | **done** | |
 | 3.12 | Owner confirms Phase 3 | **done** | 2026-11-18, "pls commit pahse 3 changes. and start pahse 4 after that" |
 
+## Phase 4 checklist
+
+| # | Task | Status | Notes |
+|---|---|---|---|
+| 4.0 | Kickoff questions (8) answered | **done** | owner: "yes to all" (2026-11-18): (1) windows + QUALIFY, set operations, grouping sets / ROLLUP / CUBE with `grouping()`, OFFSET, ORDER BY / LIMIT in subqueries, aggregate over aggregate, DISTINCT ON; (2) range-partitioned sort when the size bound exceeds `icefleet.sort.coordinatorBytes` (64 MiB), coordinator sort below; (3) sort input written once with a per-task key sample (`icefleet.sort.sampleRows`, 1000), boundaries on the coordinator between stages; (4) windows: one shuffle by shared keys, else a chain; no PARTITION BY = one partition with a warning; reuse; (5) UNION ALL with no extra stage, distinct set ops hashed on all columns cast to the result type; (6) grouping sets in one shuffle with a hidden grouping id; raw path repeats rows per set; (7) top-n subqueries via one partition, ORDER BY lifted through projections / dropped under aggregates, joins, set ops; OFFSET at the coordinator; (8) icetl's window cases on Iceberg fixtures; proof of life: window + QUALIFY, ROLLUP, UNION ALL, range sort |
+| 4.1 | Spike: icetl's optimized trees for 28 Phase 4 shapes (fixtures, read-only) | **done** | windows sit in the SELECT's projection (or `QUALIFY`), a window over an aggregate in the same SELECT as its `GROUP BY`; set operations are `exp.Union` / `Intersect` / `Except` with `distinct`, a DataFrame `union` is positional `UNION ALL`, a union under an aggregate is a subquery; `rollup` / `cube` / SQL `GROUPING SETS` stay in `GROUP BY` with `GROUPING()`; `dropDuplicates(subset)` is `DISTINCT ON`; `orderBy(...).select(...)` leaves the `ORDER BY` in a subquery under a projection, `orderBy(...).groupBy(...)` under an aggregate, `orderBy(...).limit(n).groupBy(...)` a top-n subquery; icetl's DataFrame has no `offset()`. icetl's window tests (`tests/fixture/test_window.py`) build their frames with `createDataFrame`, which icefleet runs single-node |
+| 4.2 | `plan/rel.py`: `Window`, `DistinctOn`, `TopN`, `SetOp`; window over aggregate / join and DISTINCT over window split in two; a subquery ORDER BY moved up or dropped; OFFSET lifted; aggregate over aggregate allowed; `aggregate_calls` skips window functions | **done** | |
+| 4.3 | `plan/aggregates.py`: grouping sets / ROLLUP / CUBE (icetl's `rollup()` / `cube()` form and the parsed one) in one shuffle with `__g`; `grouping()` from its bits; raw path repeats rows per set | **done** | the same set twice is refused (each would be its own group) |
+| 4.4 | `plan/stages.py`: windows (shared keys / chain / one partition, reuse), DISTINCT ON, top-n, UNION ALL branches, distinct set operations, range-sort stages; `StagePlan.final_stages`, `.offset`, `.ranged` | **done** | |
+| 4.5 | `plan/sort.py` + sinks + scheduler: key sample in the result sink, `task` input mode, boundaries filled in between stages (`Stage.resolved`, `ThreadPoolScheduler(fetch=...)`) | **done** | `icefleet.sort.coordinatorBytes` (64 MiB), `icefleet.sort.sampleRows` (1000) |
+| 4.6 | **DISTINCT ON keeps its ORDER BY** -- found while writing the tests: lifting it to the coordinator would have kept an arbitrary row per key instead of the first | **done** | `test_windows.py::test_distinct_on_keeps_the_first_row_of_its_order` |
+| 4.7 | Tests: `test_windows.py` (21 window shapes + icetl's 21 window cases on new fixtures `ties` / `gaps` / `groups`), `test_setops.py`, `test_ordering.py` (range sort incl. ties, OFFSET, top-n subqueries, grouping sets, aggregate over aggregate); unit: Phase 4 shapes, grouping sets in plain DuckDB through the real sink, the range partitioner (hypothesis + 8 types x directions x NULL placement), the sample sink | **done** | 755 tests (+247) |
+| 4.8 | `smoke_cluster.py`: window, rollup, union, sorted on `nyc.yellow_tripdata` | **done** | all equal to icetl, the sort checked key by key; the four earlier queries rerun green |
+| 4.9 | Docs: plan v1.6 (§4.2 grouping-set row, §4.4, §5, §6 "As built"), `divergence.md`, README | **done** | |
+| 4.10 | Owner confirms Phase 4 | **pending** | |
+
 ## Open decisions
 
 - ~~Which dev Kubernetes cluster?~~ **Settled 2026-11-15: Docker Desktop's built-in
@@ -159,16 +175,26 @@ No known wrong answers. Limits by design and environment issues:
   `powershell -ExecutionPolicy Bypass -File .\scripts\dev.ps1 ...`; changing the policy is
   the owner's call.
 
-- **Phase 3 limits, by design (plan §6 Phase 3 "As built"):** windows, OFFSET, ORDER BY /
-  LIMIT inside a subquery, set operations, grouping sets and an aggregate directly over an
-  aggregate (Phase 4) run single-node; so do a non-equi / cross join with no side under
-  the broadcast threshold, a full join without an equality, join keys of types that do
-  not hash alike (`VARCHAR = INTEGER`, `DATE = TIMESTAMP`), ASOF / POSITIONAL joins,
-  `NOT IN`, `EXISTS` and correlated subqueries. ORDER BY of a *large* result is
-  sorted on the coordinator (bounded by `icefleet.result.maxBytes`); the range-partitioned
-  sort is Phase 4. Still single-node from Phase 1: ENUM / BIT / VARINT / UNION result or
-  shuffled types, scans pruned to no files, renamed columns across file groups, duplicate
-  output names, UDF calls.
+- **Still single-node, by design (plan §6, Phases 1-4 "As built"):** a non-equi / cross
+  join with no side under the broadcast threshold, a full join without an equality, join
+  keys of types that do not hash alike (`VARCHAR = INTEGER`, `DATE = TIMESTAMP`), ASOF /
+  POSITIONAL joins, `NOT IN`, `EXISTS` and correlated subqueries; `UNION BY NAME`, an
+  ORDER BY / LIMIT on a set operation inside a subquery, a subquery ORDER BY on something
+  it does not select (under projections only), DISTINCT ON with an aggregate, a window
+  or a join, a window over grouping sets, the same grouping set twice, GROUP BY ALL;
+  ENUM / BIT / VARINT / UNION result or shuffled types, scans pruned to no files, renamed
+  columns across file groups (Phase 7), duplicate output names, rows the session holds
+  itself (`createDataFrame`), UDF calls (Phase 8).
+- **A window without PARTITION BY runs in one task** (decision 18), and `explain()` says
+  so; so do a top-n subquery's last step and a global aggregate's final.
+- **Many small tasks on small data:** a 64-partition shuffle of a few thousand rows makes
+  ~63 tiny final tasks (the window proof of life: 3.8 s warm against icetl's 0.9 s).
+  Adaptive coalescing is Phase 7; the default count is Phase 6's to measure.
+- **A range sort can be chosen where it does not pay:** a join's size is unknown, so an
+  ORDER BY without a LIMIT over a join always range-sorts, two more stages even for a
+  small result. Measuring the input at run time is Phase 7's.
+- **The offline suite takes 3 min 20 s** with the Phase 4 suites, over plan §9's 3-minute
+  target; fewer cluster parametrisations for the newest suites is the cheap fix.
 - **Join sizes are upper bounds, and loose for a self-join** (kickoff answer 2): icetl plans one
   `ScanPlan` per table for all its references, pruned by the union of their filters, so a
   small aggregate of the same table is bounded by the whole scan and is not broadcast at

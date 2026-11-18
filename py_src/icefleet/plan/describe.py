@@ -38,10 +38,8 @@ def describe_plan(
         for stage in staged.stages:
             indent = " " * 9
             notes = list(stage.notes)
-            reads = ", ".join(
-                f"stage {i.stage_id}{' (broadcast)' if i.mode == 'all' else ''}"
-                for i in stage.inputs
-            )
+            how = {"all": " (broadcast)", "task": " (task by task)"}
+            reads = ", ".join(f"stage {i.stage_id}{how.get(i.mode, '')}" for i in stage.inputs)
             if stage.scan is not None:
                 table = stage.table
                 named = (

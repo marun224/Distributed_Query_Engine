@@ -17,6 +17,7 @@ from icefleet.plan.rel import (
     Project,
     Query,
     Scan,
+    TopN,
     from_of,
     from_sqlglot,
     is_aggregate_call,
@@ -177,25 +178,19 @@ def test_positional_order_by() -> None:
             '(SELECT "u"."a" AS "a" FROM "fx"."u" AS "u")',
             "subquery",
         ),
-        ('SELECT ROW_NUMBER() OVER (ORDER BY "t"."a") FROM "fx"."t" AS "t"', "window"),
         ('SELECT "t"."a" FROM "fx"."t" AS "t" WHERE "t"."a" IN (SELECT 1)', "subquery"),
-        ('SELECT "a" FROM "fx"."t" UNION ALL SELECT "a" FROM "fx"."u"', "set operation"),
-        ('SELECT "t"."a" FROM "fx"."t" AS "t" LIMIT 5 OFFSET 2', "OFFSET"),
         ('SELECT "c"."x" FROM "icetl_cache_3" AS "c"', "locally"),
         ("SELECT \"a\" FROM read_parquet('x.parquet')", "single Iceberg table"),
         ("INSERT INTO t VALUES (1)", "not a SELECT"),
+        ('SELECT "t"."a" FROM "fx"."t" AS "t" QUALIFY "t"."a" > 1', "QUALIFY without a window"),
+        ('SELECT "a" FROM "fx"."t" UNION BY NAME SELECT "a" FROM "fx"."u"', "UNION BY NAME"),
         (
-            'SELECT SUM("q"."s") FROM (SELECT "t"."b" AS "b", SUM("t"."a") AS "s" '
-            'FROM "fx"."t" AS "t" GROUP BY "t"."b") AS "q"',
-            "aggregate over an aggregate",
-        ),
-        (
-            'SELECT "q"."a" FROM (SELECT "t"."a" AS "a" FROM "fx"."t" AS "t" LIMIT 3) AS "q"',
-            "inside a subquery",
+            'SELECT "q"."a" FROM (SELECT "t"."a" AS "a" FROM "fx"."t" AS "t" ORDER BY "t"."b") '
+            'AS "q"',
+            "not selected",
         ),
         ('SELECT DISTINCT "t"."b" AS "b" FROM "fx"."t" AS "t" ORDER BY "t"."a"', "DISTINCT"),
         ('SELECT DISTINCT SUM("t"."a") FROM "fx"."t" AS "t" GROUP BY "t"."b"', "DISTINCT over"),
-        ('SELECT DISTINCT ON ("t"."a") "t"."b" FROM "fx"."t" AS "t"', "DISTINCT ON"),
     ],
 )
 def test_everything_else_is_uncuttable_with_a_reason(sql: str, reason: str) -> None:
@@ -333,3 +328,107 @@ def test_a_cross_join_and_a_comma_are_cross() -> None:
     ):
         tree = cast(exp.Select, sqlglot.parse_one(sql, dialect="duckdb"))
         assert join_kind(tree.args["joins"][0]) == "cross"
+
+
+# -- Phase 4 shapes ---------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("sql", "expected"),
+    [
+        (
+            'SELECT "t"."a" AS "a", ROW_NUMBER() OVER (PARTITION BY "t"."b" ORDER BY "t"."a") '
+            'AS "n" FROM "fx"."t" AS "t"',
+            ["Window", "Scan"],
+        ),
+        (
+            'SELECT "t"."a" AS "a" FROM "fx"."t" AS "t" QUALIFY ROW_NUMBER() OVER '
+            '(PARTITION BY "t"."b" ORDER BY "t"."a") <= 2',
+            ["Window", "Scan"],
+        ),
+        (
+            'SELECT "t"."b" AS "b", SUM("t"."a") AS "s", RANK() OVER (ORDER BY SUM("t"."a")) '
+            'AS "r" FROM "fx"."t" AS "t" GROUP BY "t"."b"',
+            ["Window", "Aggregate", "Scan"],
+        ),
+        (
+            'SELECT DISTINCT "t"."b" AS "b", COUNT(*) OVER (PARTITION BY "t"."b") AS "n" '
+            'FROM "fx"."t" AS "t"',
+            ["Aggregate", "Window", "Scan"],
+        ),
+        (
+            'SELECT "t"."a" AS "a", RANK() OVER (PARTITION BY "u"."b" ORDER BY "t"."a") AS "r" '
+            'FROM "fx"."t" AS "t" JOIN "fx"."u" AS "u" ON "t"."a" = "u"."a"',
+            ["Window", "Join", "Scan", "Scan"],
+        ),
+        (
+            'SELECT "t"."a" AS "a" FROM "fx"."t" AS "t" UNION ALL '
+            'SELECT "u"."a" AS "a" FROM "fx"."u" AS "u"',
+            ["SetOp", "Project", "Scan", "Project", "Scan"],
+        ),
+        (
+            'SELECT DISTINCT ON ("t"."a") "t"."b" AS "b" FROM "fx"."t" AS "t"',
+            ["DistinctOn", "Scan"],
+        ),
+        (
+            'SELECT SUM("q"."s") AS "m" FROM (SELECT "t"."b" AS "b", SUM("t"."a") AS "s" '
+            'FROM "fx"."t" AS "t" GROUP BY "t"."b") AS "q"',
+            ["Aggregate", "Aggregate", "Scan"],
+        ),
+        (
+            'SELECT "q"."a" AS "a" FROM (SELECT "t"."a" AS "a" FROM "fx"."t" AS "t" '
+            'ORDER BY "t"."a" DESC LIMIT 3) AS "q"',
+            ["Project", "TopN", "Project", "Scan"],
+        ),
+    ],
+)
+def test_phase_4_shapes(sql: str, expected: list[str]) -> None:
+    query = recognise(sql)
+    assert isinstance(query, Query), query
+    assert shape(query) == expected
+
+
+def test_offset_is_lifted_with_the_limit() -> None:
+    query = recognise(
+        'SELECT "t"."a" AS "a" FROM "fx"."t" AS "t" ORDER BY "t"."a" LIMIT 5 OFFSET 2'
+    )
+    assert isinstance(query, Query)
+    assert (query.limit, query.offset) == (5, 2)
+
+
+def test_a_window_function_is_not_an_aggregate_of_its_select() -> None:
+    query = recognise(
+        'SELECT "t"."a" AS "a", SUM("t"."a") OVER (ORDER BY "t"."a") AS "run" FROM "fx"."t" AS "t"'
+    )
+    assert isinstance(query, Query) and shape(query) == ["Window", "Scan"]
+
+
+def test_a_subquery_order_climbs_through_projections() -> None:
+    """`df.orderBy("a").select(...)`: the order belongs to the result."""
+    query = recognise(
+        'SELECT "q"."b" AS "b" FROM (SELECT "t"."a" AS "a", "t"."b" AS "b" FROM "fx"."t" AS "t" '
+        'ORDER BY "t"."a" DESC) AS "q"'
+    )
+    assert isinstance(query, Query), query
+    assert query.hidden == ("__icefleet_order_0",)
+    assert query.order[0].sql(dialect="duckdb") == '"__icefleet_order_0" DESC'
+
+
+def test_a_subquery_order_under_an_aggregate_is_dropped() -> None:
+    query = recognise(
+        'SELECT "q"."b" AS "b", COUNT(*) AS "n" FROM (SELECT "t"."b" AS "b" FROM "fx"."t" AS "t" '
+        'ORDER BY "t"."a") AS "q" GROUP BY "q"."b"'
+    )
+    assert isinstance(query, Query), query
+    assert query.order == () and " ORDER BY " not in query.tree.sql(dialect="duckdb")
+
+
+def test_a_top_n_subquery_keeps_its_columns() -> None:
+    query = recognise(
+        'SELECT "q"."b" AS "b" FROM (SELECT "t"."b" AS "b" FROM "fx"."t" AS "t" '
+        'ORDER BY "t"."a" LIMIT 3 OFFSET 1) AS "q"'
+    )
+    assert isinstance(query, Query)
+    top = next(n for n in query.nodes() if isinstance(n, TopN))
+    assert (top.limit, top.offset, top.columns) == (3, 1, ("b",))
+    assert [o.sql(dialect="duckdb") for o in top.order] == ['"__icefleet_order_0"']
