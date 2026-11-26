@@ -8,6 +8,7 @@ differ.
 from __future__ import annotations
 
 import shutil
+from collections.abc import Sequence
 from pathlib import Path
 
 from icetl.paths import engine_path
@@ -30,3 +31,7 @@ class LocalDirExchange(Exchange):
 
     def delete_query(self, query_id: str) -> None:
         shutil.rmtree(self.query_prefix(query_id), ignore_errors=True)
+
+    def delete_files(self, paths: Sequence[str]) -> None:
+        for path in paths:
+            Path(engine_path(path)).unlink(missing_ok=True)

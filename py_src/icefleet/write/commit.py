@@ -9,6 +9,12 @@
 `commit_with_retry` (icetl's) reruns the whole transaction against freshly loaded
 metadata when a concurrent writer wins the race; `add_files` refuses a file already in
 the table, so a retry cannot add one twice.
+
+A copy-on-write rewrite (Phase 5b) is `replace_files`: the files it read out, the files
+it wrote in, one OVERWRITE snapshot -- on the table *as it was planned*, never reloaded,
+so PyIceberg's `AssertRefSnapshotId` refuses the commit if anything committed since.
+That refusal is not retried here: the rows written were computed from files that may no
+longer be the table's, so the caller plans the statement again (`write/rowlevel.py`).
 """
 
 from __future__ import annotations
@@ -22,9 +28,10 @@ from icetl.sql.writer import commit_with_retry
 
 if TYPE_CHECKING:
     from pyiceberg.expressions import BooleanExpression
+    from pyiceberg.manifest import DataFile
     from pyiceberg.table import Table
 
-__all__ = ["commit_files", "partition_filter"]
+__all__ = ["commit_files", "partition_filter", "replace_files"]
 
 
 def _literal(value: Any) -> Any:
@@ -82,3 +89,33 @@ def commit_files(
                 transaction.add_files(file_paths=list(paths))
 
     commit_with_retry(operation)
+
+
+def replace_files(table: Table, remove: Sequence[DataFile], paths: Sequence[str]) -> None:
+    """Swap the data files `remove` for the files at `paths`, in one snapshot of `table`.
+
+    `table` must be the object the statement was planned on: the commit asserts its
+    snapshot, so a concurrent commit makes it raise `CommitFailedException` (PyIceberg
+    would otherwise remove a file no longer in the table without a word). Nothing to
+    remove is an append -- `add_files`, one APPEND snapshot, as icetl's insert-only MERGE
+    makes; nothing at all is no commit.
+    """
+    if not remove:
+        if paths:
+            with table.transaction() as transaction:
+                transaction.add_files(file_paths=list(paths), check_duplicate_files=False)
+        return
+
+    from pyiceberg.table import _parquet_files_to_data_files
+
+    with table.transaction() as transaction:
+        # The footers are read as add_files reads them: statistics, the partition value
+        # (one per file, or PyIceberg refuses it), the schema checked against the table's.
+        added = _parquet_files_to_data_files(
+            table_metadata=transaction.table_metadata, file_paths=list(paths), io=table.io
+        )
+        with transaction.update_snapshot().overwrite() as overwrite:
+            for data_file in remove:
+                overwrite.delete_data_file(data_file)
+            for data_file in added:
+                overwrite.append_data_file(data_file)

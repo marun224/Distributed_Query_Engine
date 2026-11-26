@@ -14,11 +14,14 @@ the catalog. Only execution changes (PLAN §3.2):
 
 Writes (Phase 5) go through `df.write`, which on a ClusterSession is a
 `ClusterDataFrameWriter` (`write/writer.py`): the workers write the data files, this
-process commits them once.
+process commits them once. `DELETE` / `UPDATE` / `MERGE` (Phase 5b) go through
+`_row_level` to `write/rowlevel.py`: the workers rewrite the files holding a row the
+statement changes, this process swaps them in one snapshot.
 
-The seams are icetl's private `_execute`, `_stream`, `_compile`, `DataFrame._explain_text`,
-`DataFrame.write` and `DataFrameWriter._save` / `_derive`, which is why icetl is pinned
-exactly (PLAN §4.10) and `py_test/test_seams.py` checks every one of them.
+The seams are icetl's private `_execute`, `_stream`, `_compile`, `_row_level`,
+`DataFrame._explain_text`, `DataFrame.write` and `DataFrameWriter._save` / `_derive`, and
+icetl's row-level helpers, which is why icetl is pinned exactly (PLAN §4.10) and
+`py_test/test_seams.py` checks every one of them.
 """
 
 from __future__ import annotations
@@ -133,6 +136,9 @@ class ClusterSession(Session):
         # which sets `_last_run` to that read, so a write keeps its own record.
         self._last_write: QueryRun | None = None
         self._aggregate_names: frozenset[str] | None = None
+        # Scan key -> the only data files it may read, while a row-level statement
+        # plans its rewrite (Phase 5b, `_pinning`).
+        self._pinned: dict[str, frozenset[str]] = {}
 
     def __repr__(self) -> str:
         name = self._conf.get("icetl.appName", "icetl")
@@ -222,6 +228,7 @@ class ClusterSession(Session):
         output_names: Sequence[str],
         *,
         write: WriteTarget | None = None,
+        probe: str | None = None,
     ) -> StagePlan | Uncuttable:
         compiled = self._compile(plan, sources, output_names)
         _, slots = self._cluster_shape()
@@ -238,6 +245,8 @@ class ClusterSession(Session):
             udf_names=udfs,
             aggregate_names=self._duckdb_aggregates(),
             write=write,
+            restrict=self._pinned,
+            probe=probe,
         )
 
     def _describe_distributed(
@@ -467,7 +476,16 @@ class ClusterSession(Session):
                     exchange.delete_query(query_id)
                 except Exception as exc:
                     logger.warning("could not remove the exchange prefix of %s: %s", query_id, exc)
-        files = [f for r in results if r.stage_id in staged.finals for f in r.data]
+        reported = [f for r in results if r.stage_id in staged.finals for f in r.data]
+        files = [f for f in reported if f.rows > 0]
+        empty = [f.path for f in reported if f.rows == 0]
+        if empty:
+            # An unpartitioned task with no rows writes one empty file: never committed,
+            # so removed now rather than left in the table's folder.
+            try:
+                written.delete_files(empty)
+            except Exception as exc:  # never mask the write's own outcome
+                logger.warning("could not remove %d empty data file(s): %s", len(empty), exc)
         self._last_write = self._last_run = QueryRun(
             mode="distributed",
             query_id=query_id,
@@ -498,6 +516,47 @@ class ClusterSession(Session):
         )
         rows = self._fetch(sql, {_RESULT_PARAMETER: paths})
         return [dict(zip(columns, row, strict=True)) for row in rows]
+
+    # -- row-level operations (Phase 5b) ------------------------------------------
+
+    def _row_level(self, plan: exp.Delete | exp.Update | exp.Merge) -> DataFrame:
+        """`DELETE` / `UPDATE` / `MERGE`: copy-on-write, the files rewritten by the workers
+        (`write/rowlevel.py`); icetl's own planner for what cannot be distributed."""
+        from icefleet.write.rowlevel import run_row_level
+
+        run_row_level(self, self._inline_temp_views(plan))
+        return self._empty_frame()
+
+    @contextmanager
+    def _pinning(self, files: Mapping[str, frozenset[str]]) -> Iterator[None]:
+        """While open, every plan reads only `files` of those scans (by source key)."""
+        previous = dict(self._pinned)
+        self._pinned.update(files)
+        try:
+            yield
+        finally:
+            self._pinned = previous
+
+    def _matching_files(self, query: exp.Expression, key: str) -> frozenset[str] | None:
+        """The data files of scan `key` holding a row `query` (a filter over it) keeps, as
+        the scan spells them; None when that cannot be found out distributed."""
+        df = self._frame_for(query)
+        compiled = self._compile(df._plan, df._sources, df.columns)
+        scan = next((s for s in compiled.scans if s.source.key == key), None)
+        if scan is not None and scan.is_empty:
+            return frozenset()  # Iceberg's own pruning already says: no file can hold one
+        staged = self._stage_plan(df._plan, df._sources, df.columns, probe=key)
+        if isinstance(staged, Uncuttable):
+            logger.info("no file probe (%s): every candidate file is rewritten", staged.reason)
+            return None
+        with self._distributed(staged) as files:
+            column = exp.to_identifier(staged.columns[0], quoted=True).sql(dialect="duckdb")
+            rows = self._fetch(
+                f"SELECT DISTINCT {column} FROM read_parquet(${_RESULT_PARAMETER}, "
+                f"union_by_name => false, hive_partitioning => false)",
+                {_RESULT_PARAMETER: [f.path for f in files]},
+            )
+        return frozenset(str(row[0]) for row in rows if row[0] is not None)
 
     # -- lifecycle ---------------------------------------------------------
 

@@ -8,13 +8,15 @@ Update at the end of every session. Design lives in
 
 | | |
 |---|---|
-| Last updated | 2026-11-18 |
-| Current phase | **Phase 5 — Distributed writes: built, gate green, awaiting owner confirmation** (Phase 4 confirmed 2026-11-18) |
-| Last updated (git) | 2026-11-16: Phase 1 committed (`fb937a7`) and pushed to the new **public** repo https://github.com/marun224/Distributed_Query_Engine (`origin`, `main` tracks `origin/main`). **Phase 2 committed on `main`** at the owner's request ("pls commit phase 2", 2026-11-16; `88fc616`). **Pushed:** checked 2026-11-18 with `git ls-remote`, GitHub's `main` is `88fc616`. **Phase 3 committed on `main`** at the owner's request ("pls commit pahse 3 changes", 2026-11-18; the commit after `88fc616`, see `git log`). **Not pushed.** **Phase 4 committed on `main`** at the owner's request ("pls commit phase 4 chnages to git", 2026-11-18; `8325d38`). **Phases 3 and 4 pushed** 2026-11-18 at the owner's request ("pls push"): GitHub's `main` is `8325d38` (checked with `git ls-remote`) |
-| Next action | **Owner to confirm Phase 5** (and say whether to commit / push it); then the Phase 5b kickoff questions |
-| Next phase | Phase 5b — Row-level operations (DELETE / UPDATE / MERGE) |
-| Blocked on | Owner confirmation only |
-| Gate | **`.\scripts\dev.ps1 uv run tox` green on 2026-11-18** (Phase 5): lint · type · py312 **820 passed** · dist, 190 s (tests 2 min 54 s). Proof of life: `scripts/smoke_cluster.py` (eight read queries, Phase 4) and **`scripts/smoke_write.py` OK** -- five writes of a month of trips into `icefleet_it`, each equal to icetl. The Windows `.venv` gate is not authoritative (decision 28) |
+| Last updated | 2026-11-26 |
+| Current phase | **Phase 5b — done and confirmed** (owner, 2026-11-26: "Confirm, commit + push", after the gate was re-run green). Phase 6 not started: it waits for its kickoff questions |
+| Working tree | Phase 5b committed on `main` and pushed (2026-11-26); see "Last updated (git)" |
+| On resume | 1. Read this tracker (Known gaps, Open decisions). 2. `.\scripts\dev.ps1 up` (start the `iceberg-nyc` catalog stack first if Docker restarted). 3. Read plan §6 Phase 6 and §3.5 in full. 4. Ask the owner the Phase 6 kickoff questions (incl. Docker Desktop Kubernetes vs the `kind` cluster, Argo install) |
+| Last updated (git) | 2026-11-16: Phase 1 committed (`fb937a7`) and pushed to the new **public** repo https://github.com/marun224/Distributed_Query_Engine (`origin`, `main` tracks `origin/main`). **Phase 2 committed on `main`** at the owner's request ("pls commit phase 2", 2026-11-16; `88fc616`). **Pushed:** checked 2026-11-18 with `git ls-remote`, GitHub's `main` is `88fc616`. **Phase 3 committed on `main`** at the owner's request ("pls commit pahse 3 changes", 2026-11-18; the commit after `88fc616`, see `git log`). **Not pushed.** **Phase 4 committed on `main`** at the owner's request ("pls commit phase 4 chnages to git", 2026-11-18; `8325d38`). **Phases 3 and 4 pushed** 2026-11-18 at the owner's request ("pls push"): GitHub's `main` is `8325d38` (checked with `git ls-remote`). **Phase 5 committed and pushed** at the owner's request ("pls commit and psuh pahse 5 chnages", 2026-11-18): `7825cc5`, `main` == `origin/main`. **Phase 5b committed and pushed** at the owner's request ("Confirm, commit + push", 2026-11-26): the commit after `7825cc5`, see `git log`; every 5b file staged from the working tree (several had been only partly staged) |
+| Next action | **Phase 6 kickoff questions** to the owner (plan §6 Phase 6, §3.5) |
+| Next phase | Phase 6 — image, Kubernetes, Argo fleet-per-workflow |
+| Blocked on | Owner: Phase 6 kickoff answers |
+| Gate | **Re-run green on 2026-11-26** on resume, working tree unchanged since the pause: lint · type · py312 856 passed (3 min 17 s) · dist, 214 s. **`.\scripts\dev.ps1 uv run tox` green on 2026-11-18** (Phase 5b): lint · type · py312 **856 passed** · dist, 204 s (tests 3 min 15 s, over plan §9's 3 minutes: Known gaps). Proof of life: `scripts/smoke_cluster.py` (eight read queries, Phase 4), `scripts/smoke_write.py` (five writes, Phase 5) and **`scripts/smoke_rowlevel.py` OK** -- a DELETE, an UPDATE and a MERGE on a month of trips in `icefleet_it`, each equal to icetl's twin. The Windows `.venv` gate is not authoritative (decision 28) |
 
 ## Phases
 
@@ -25,7 +27,7 @@ Update at the end of every session. Design lives in
 | 2 | Exchange (shuffle) + two-phase aggregation + explain DAG | **done** | 2026-11-16 | **yes, 2026-11-18** |
 | 3 | Joins: broadcast and shuffle hash | **done** | 2026-11-18 | **yes, 2026-11-18** |
 | 4 | Windows, distributed ORDER BY (range partitioning), OFFSET, set operations, grouping sets | **done** | 2026-11-18 | **yes, 2026-11-18** |
-| 5 | Distributed writes, one commit; 5b row-level operations | **5 built — awaiting confirmation**; 5b not started | 2026-11-18 | pending |
+| 5 | Distributed writes, one commit; 5b row-level operations | **done** (5 and 5b) | 2026-11-18 | **5: yes, 2026-11-18** ("pls start pahse 5b"); **5b: yes, 2026-11-26** |
 | 6 | Container image, Kubernetes manifests, Argo fleet-per-workflow, integration tier, benchmarks (decision 27) | not started | — | — |
 | 6b | Argo as a scheduler backend: pod per task (`ArgoScheduler`, `icefleet-worker run-task`) | not started | — | — |
 | 7 | Task retry (thread-pool backend), adaptive partitions, skew, renamed-column splits, `explain(analyze)` | not started | — | — |
@@ -131,7 +133,22 @@ Update at the end of every session. Design lives in
 | 5.7 | Tests: `test_writes.py` (twin tables written by the cluster and by icetl: create, partitioned, append / overwrite snapshots, dynamic, insertInto, SQL INSERT / CTAS, nested / join / aggregate / limit / union, six time transforms, fallbacks, modes, refusals, failure clean-up, renames); `test_write.py` (transforms, types, field ids, retry, sink) | **done** | 820 tests (+65) |
 | 5.8 | `scripts/smoke_write.py` on the dev catalog | **done** | all five steps equal to icetl; one file per partition value written |
 | 5.9 | Docs: plan v1.7, `divergence.md`, README | **done** | |
-| 5.10 | Owner confirms Phase 5 | **pending** | |
+| 5.10 | Owner confirms Phase 5 | **done** | 2026-11-18, "pls start pahse 5b" (after "pls commit and psuh"); committed and pushed as `7825cc5` |
+
+## Phase 5b checklist
+
+| # | Task | Status | Notes |
+|---|---|---|---|
+| 5b.0 | Kickoff questions (9) answered | **done** | owner: "yes to all" (2026-11-18); recorded in plan §6 Phase 5b "As built" |
+| 5b.1 | Spike (throwaway SqlCatalog warehouses in `/tmp/p5b_spike*`; dev catalog not opened) | **done** | **Today on a `ClusterSession`** (icetl's `Session._row_level`, inherited): DELETE / UPDATE already *read* distributed (icetl's planner runs a SELECT through `_frame_for(...).toArrow()`), then the rows come back to the coordinator and `table.overwrite(rows, overwrite_filter=P)` writes them (delete + append, 2 snapshots); an exactly-translatable DELETE is PyIceberg's `table.delete(P)` (1 overwrite snapshot), which rewrites every partly-matching file **on the coordinator**. **MERGE with `WHEN NOT MATCHED THEN INSERT (some columns)` fails in icetl itself** (untyped NULL -> `timestamp` / `decimal` cast), so the same on the cluster. **PyIceberg 0.11.1** `tx.update_snapshot().overwrite()` with `delete_data_file` / `append_data_file` replaces named files in **one OVERWRITE snapshot**; a concurrent commit in between is refused (`AssertRefSnapshotId`: `CommitFailedException`); deleting a file no longer in the table is **accepted silently** (so the commit must be made against the snapshot that was planned). **icefleet today:** a correlated `EXISTS` / `NOT EXISTS` runs single-node ("a subquery"); spelled as `LEFT SEMI` / `LEFT ANTI JOIN` every MERGE half distributes, the three halves as one `UNION ALL` in 6 stages; DELETE survivors and the UPDATE `CASE` are one stage each. DuckDB 1.5.6's `filename` and `file_row_number` virtual columns work on our `read_parquet($p, ...)` |
+| 5b.2 | `plan/stages.py`: a scan restricted to an allow-list of its files (refused if the plan would not read one); a file probe (`probe=key`: DuckDB's `filename` on that scan's relation, `SELECT DISTINCT`); `WriteTarget.shuffle` off for a rewrite that keeps rows in their partition | **done** | |
+| 5b.3 | `write/commit.py` `replace_files`: named files out, written files in, one OVERWRITE snapshot on the table as planned; nothing to remove = `add_files` (APPEND) | **done** | a concurrent commit raises `CommitFailedException` (unit-tested) |
+| 5b.4 | `write/rowlevel.py` + `ClusterSession._row_level` / `_pinning` / `_matching_files`: DELETE (metadata path kept), UPDATE, MERGE (semi / anti joins, typed NULL inserts, icetl's one-match rule as two distributed counts, insert-only = append, empty target); re-plan on a lost race; icetl's planner as fallback | **done** | icetl's private row-level helpers pinned in `test_seams.py` |
+| 5b.5 | Empty data files (an unpartitioned task with no rows) deleted by the coordinator (`Exchange.delete_files`), no longer left uncommitted | **done** | Phase 5's known gap; MERGE's anti-join halves made it common |
+| 5b.6 | Tests: `test_rowlevel.py` (13 statements equal to icetl in one snapshot with no stray files; the probe rewrites 1 file; a MERGE's keys narrow it to 1 file; nothing matched = no commit; metadata deletes; partitions kept and moved; insert-only append; typed NULL inserts where icetl fails; duplicate match refused; empty target; a lost race re-planned; a failed rewrite; bucket and IN-subquery fallbacks; `fallback=error`; icetl's refusals); `test_write.py` (`replace_files`, the empty file) | **done** | 856 tests (+36); on `local[2]` only (module fixture), to hold the gate's time |
+| 5b.7 | `scripts/smoke_rowlevel.py` on the dev catalog | **done** | DELETE 31/31 files (2.2 s, icetl 3.5 s), UPDATE 1/31, MERGE 1/31 (13.0 s, icetl 5.3 s); each one snapshot, equal to icetl's twin |
+| 5b.8 | Docs: plan v1.8 (§4.6, §4.10, §5, §6 5b), `divergence.md`, README | **done** | |
+| 5b.9 | Owner confirms Phase 5b | **done** | 2026-11-26, "Confirm, commit + push" (after the gate was re-run green: 856 passed); committed and pushed |
 
 
 
@@ -211,17 +228,33 @@ No known wrong answers. Limits by design and environment issues:
 - **A range sort can be chosen where it does not pay:** a join's size is unknown, so an
   ORDER BY without a LIMIT over a join always range-sorts, two more stages even for a
   small result. Measuring the input at run time is Phase 7's.
-- **The offline suite took 3 min 20 s** after Phase 4, 2 min 54 s at Phase 5 (machine
-  load varies); plan §9's target is 3 minutes.
+- **The offline suite took 3 min 20 s** after Phase 4, 2 min 54 s at Phase 5 and
+  3 min 15 s at Phase 5b (machine load varies; the row-level suite already runs on
+  `local[2]` only); plan §9's target is 3 minutes. Phase 6's integration tier is the
+  place to move the slowest end-to-end cases.
 - **A write's leftovers after a coordinator crash:** files written under
   `<table>/data/icefleet/<query>/` before the crash are referenced by nothing; Iceberg's
   orphan-file removal (or `icefleet-admin gc`, Phase 7) clears them. A failed write the
-  coordinator survives removes its own. A task with no rows of an unpartitioned table
-  still leaves one empty, uncommitted file under that prefix.
+  coordinator survives removes its own (and, since Phase 5b, the empty files of tasks
+  with no rows).
 - **Still icetl's single-node writer (Phase 5 "As built"):** `mergeSchema`, `bucket` /
   `truncate` partitions, `time` / `uuid` / `fixed` / nanosecond columns, a dynamic
   overwrite of a transform-partitioned table (PyIceberg's own limit), a write whose
-  query runs single-node. Row-level DELETE / UPDATE / MERGE is Phase 5b.
+  query runs single-node.
+- **Row-level statements on icetl's planner (Phase 5b "As built"):** a target the
+  writer above cannot write, delete files (merge-on-read, which icetl refuses anyway),
+  renamed columns, and a rewrite no stage can hold -- notably `DELETE` / `UPDATE ... WHERE
+  x IN (SELECT ...)`, whose subquery ends up inside `NOT COALESCE(...)` / a `CASE`, and a
+  `MERGE` whose source has a `SELECT` without a `FROM`. Their reads are still
+  distributed where they can be; icetl's own limits apply (its typed-NULL `MERGE` error
+  among them).
+- **A `MERGE` costs more planning queries than icetl's** (Phase 5b): the source's key
+  values, the one-match check (two counts), the file probe and the rewrite each evaluate
+  the source again. On small data that is many small tasks (the proof of life: 13.0 s
+  against icetl's 5.3 s for a one-day merge). Materialising the source once is Phase 7's.
+- **The file probe narrows by target-only terms only:** a condition reaching the target
+  through a join or subquery is not probed, and a `MERGE` with more than 1000 distinct
+  source keys (icetl's limit) probes by its other terms, perhaps rewriting every file.
 - **Join sizes are upper bounds, and loose for a self-join** (kickoff answer 2): icetl plans one
   `ScanPlan` per table for all its references, pruned by the union of their filters, so a
   small aggregate of the same table is bounded by the whole scan and is not broadcast at

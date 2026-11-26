@@ -501,4 +501,111 @@ curl -s http://localhost:8182/v1/namespaces/nyc/tables/yellow_tripdata   # 12 sn
 # docs: plan v1.7, task_tracker (Phase 5 built), divergence.md, README
 git status --short; git log --oneline -1   # after a context reset: Phase 5 uncommitted, HEAD 8325d38
 # task_tracker: deferred row for write transforms narrowed to bucket / truncate
+git add -A   # + a scan of the 19 staged files for .env secret values: none
+git commit -F -   # 7825cc5 Phase 5: distributed writes, one commit
+git push          # 8325d38..7825cc5 main -> main
+```
+
+## 2026-11-18 — Phase 5 committed, pushed and confirmed; Phase 5b kickoff and spike (read-only)
+
+```powershell
+# "pls commit and psuh pahse 5 chnages" -> 7825cc5 (logged above); "pls start pahse 5b" = Phase 5 confirmed
+grep -n "5b|Phase 5|^## |^### " docs/PLAN_distributed_engine.md     # plan §4.6, §6 Phase 5 / 5b, §7, §8 read
+# icetl 0.1.0 read: src/icetl/sql/rowlevel.py (run_delete / run_update / run_merge), session.py _row_level,
+#   writer.py commit_with_retry; icefleet plan/splits.py, plan/stages.py (scan placeholders)
+grep -n -A2 'name = "pyiceberg"' uv.lock                             # 0.11.1
+docker cp <scratchpad>\p5b_spike.py icefleet-dev:/tmp/; .\scripts\dev.ps1 uv run python /tmp/p5b_spike.py
+#   round 1 stopped on the spike's own guessed data path -> written beside the victim file, rerun:
+#   file-level replace = 1 OVERWRITE snapshot; concurrent commit refused; a missing file deleted silently;
+#   DELETE / UPDATE on ClusterSession read distributed, written by icetl on the coordinator; MERGE failed
+docker cp <scratchpad>\p5b_spike2.py icefleet-dev:/tmp/; .\scripts\dev.ps1 uv run python /tmp/p5b_spike2.py
+#   the MERGE failure is icetl's own (INSERT of some columns: untyped NULL -> timestamp); icefleet types = icetl's
+docker cp <scratchpad>\p5b_spike3.py icefleet-dev:/tmp/; .\scripts\dev.ps1 uv run python /tmp/p5b_spike3.py
+#   correlated EXISTS / NOT EXISTS -> single-node ("a subquery"); DuckDB filename / file_row_number virtual columns work
+docker cp <scratchpad>\p5b_spike4.py icefleet-dev:/tmp/; .\scripts\dev.ps1 uv run python /tmp/p5b_spike4.py
+#   LEFT SEMI / LEFT ANTI JOIN distribute; the three MERGE halves as one UNION ALL: 6 stages, distributed
+#   warehouses: /tmp/p5b_spike, /tmp/p5b_spike2..4 (throwaway SqlCatalogs); the dev catalog was never opened
+# tracker: Phase 5 confirmed (5.10), Phase 5b checklist (5b.0 asked, 5b.1 spike done)
+```
+
+## 2026-11-18 — Phase 5b build ("yes to all" to the nine kickoff questions)
+
+```powershell
+.venv\Scripts\python -c "<sqlglot: LEFT ANTI / SEMI join and VERSION AS OF node shapes>"   # editor venv, sqlglot only
+docker cp <scratchpad>\p5b_src.py icefleet-dev:/tmp/; .\scripts\dev.ps1 uv run python /tmp/p5b_src.py
+#   PyIceberg 0.11.1 Transaction.add_files / _parquet_files_to_data_files source read
+# code: plan/stages.py (restrict, file probe, WriteTarget.shuffle), write/commit.py replace_files,
+#   write/rowlevel.py (new), session.py (_row_level, _pinning, _matching_files), write/target.py shuffle
+docker cp <scratchpad>\p5b_try.py icefleet-dev:/tmp/; .\scripts\dev.ps1 uv run python /tmp/p5b_try.py
+#   10 statements on twin tables in /tmp/p5b_try: every one equal to icetl where icetl succeeds, one snapshot each;
+#   icetl itself fails both MERGEs inserting some columns (timestamp / decimal)
+.\scripts\dev.ps1 uv run python -m pytest -q -p no:randomly -x py_test/cluster/test_rowlevel.py
+#   1 failed: 4 stray files -- the empty file an unpartitioned task with no rows writes (Phase 5's known gap)
+#   -> the sink reports it, the coordinator deletes it (Exchange.delete_files)
+.\scripts\dev.ps1 uv run python -m pytest -q -p no:randomly py_test/unit/test_write.py py_test/cluster/test_rowlevel.py
+#   6 failed (3 x 2 fleets): the test's 'n5' matched nothing (names are 'name-NN'; -> id % 2000 = 5);
+#   a partitionBy table has two specs (-> check the touched files' spec, not the table's); a twin's NULLs untyped
+.\scripts\dev.ps1 uv run python -m pytest -q -p no:randomly py_test/cluster/test_rowlevel.py   # 60 passed, 85 s
+.\scripts\dev.ps1 uv run tox -e lint,type     # PowerShell split the comma: tox usage error -> run one by one
+.\scripts\dev.ps1 uv run tox -e lint          # 1: unused import
+.\scripts\dev.ps1 uv run tox -e type          # 1: an annotation
+.\scripts\dev.ps1 uv run python -m ruff format <the four new / changed test and source files>
+.\scripts\dev.ps1 uv run python scripts/smoke_rowlevel.py
+#   DELETE / UPDATE OK; the MERGE source's constant-row SELECT (no FROM) is not distributable -> icetl's planner,
+#   which fails on its own typed-NULL bug; the script's source changed to zones of the next day
+.\scripts\dev.ps1 uv run python scripts/smoke_rowlevel.py
+#   all three equal to icetl's twin, but the MERGE replaced 31 of 31 files: icetl's scope keeps only exactly
+#   translatable terms (a date IN list is not) -> the scope built from icetl's _key_pairs / _distinct_values,
+#   every term probed
+.\scripts\dev.ps1 uv run python -m pytest -q -p no:randomly py_test/cluster/test_rowlevel.py py_test/test_seams.py py_test/unit/test_write.py   # 64 passed
+.\scripts\dev.ps1 uv run python scripts/smoke_rowlevel.py
+#   OK: DELETE 31/31 files 2.2 s (icetl 3.5 s), UPDATE 1/31, MERGE 1/31 13.0 s (icetl 5.3 s); one snapshot each;
+#   both icefleet_it tables purged; nyc only read
+.\scripts\dev.ps1 uv run tox                  # green: 856 passed, tests 3 min 25 s
+.\scripts\dev.ps1 uv run python -m pytest -q -p no:randomly py_test/cluster/test_rowlevel.py --durations=15
+#   fleet start-ups dominate -> the two fresh_cluster tests moved onto the module's local[2] fleet
+.\scripts\dev.ps1 uv run tox                  # lint/type/py312/dist OK, 204 s -- Phase 5b gate green
+.\scripts\dev.ps1 uv run tox -e py312         # 856 passed in 3 min 18 s (over plan §9's 3 minutes: tracker, Known gaps)
+# docs: plan v1.8 (§4.6, §4.10, §5, §6 Phase 5b), divergence.md, README, task_tracker (Phase 5b built)
+git status --porcelain -uall   # + a UTF-8 check of the 18 changed files: all valid
+#   note: most Phase 5b files show as *staged*; no git add was run in this phase (not by these commands)
+.\scripts\dev.ps1 uv run tox -e lint          # OK after session.py's docstring names the _row_level seam
+# "i want to pause now": tracker updated with the paused state, the working tree and how to resume
+```
+
+## 2026-11-22 — resume: orientation only (read-only; owner asked "can you understand the current project?")
+
+```
+wc -l docs/*.md README.md; find py_src py_test scripts deploy -type f   # layout
+git diff --stat; git diff --cached --stat                               # Phase 5b still uncommitted, partly staged
+grep -n '^#' docs/PLAN_distributed_engine.md; tail docs/commands.md      # orientation
+```
+
+## 2026-11-26 — resume: project check (read-only; owner asked "can you check the current project in the path")
+
+```
+git status --short; git diff --cached --stat; git diff --stat; git diff -- py_src py_test   # Phase 5b still uncommitted, partly staged
+git log --oneline -3; git rev-parse origin/main                                              # HEAD 7825cc5 == origin/main
+tail -40 docs/commands.md; docker ps                                                         # iceberg-nyc stack up; icefleet-dev not running
+```
+
+Owner: "Yes, re-run gate" (2026-11-26).
+
+```
+.\scripts\dev.ps1 up                          # image cached, icefleet-dev started
+.\scripts\dev.ps1 setup                       # online mode, nothing to install (icetl 0.1.0, duckdb 1.5.6, pyarrow 26.0.1)
+.\scripts\dev.ps1 uv run tox                  # green: lint, type, py312 856 passed in 3 min 17 s, dist -- 214 s total
+#   one warning: PyIceberg "Delete operation did not match any records" in test_a_merge_into_an_empty_table_inserts (expected)
+#   the NativeCommandError line is PowerShell 5.1 wrapping uv build's stderr through 2>&1, not a failure
+```
+
+Owner: "Confirm, commit + push" (2026-11-26) -- Phase 5b confirmed.
+
+```
+git log -1 --format=%B 7825cc5                # commit message style
+# credential check: .env has no secret / password / key / token entries; smoke_rowlevel.py has none
+git add -A -- README.md docs py_src py_test scripts/smoke_rowlevel.py   # every 5b file from the working tree
+git commit                                    # "Phase 5b: row-level DELETE / UPDATE / MERGE, one snapshot"
+git push origin main
+git ls-remote origin main                     # GitHub's main == local HEAD
 ```

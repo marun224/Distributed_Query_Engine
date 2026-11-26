@@ -32,7 +32,15 @@ hands:
                 a range sort (`plan/sort.py`)
     a write     (Phase 5) the result cast to the table's types; a partitioned table's rows
                 shuffled by their partition values first, so each value is written by one
-                task; every final task writes Iceberg data files (`write/target.py`)
+                task; every final task writes Iceberg data files (`write/target.py`).
+                A rewrite whose rows cannot change partition (Phase 5b) skips the shuffle:
+                each task writes a file per partition value it holds
+    a probe     (Phase 5b) the distinct data files of one scan holding a row its filter
+                keeps: DuckDB's `filename` column, added to that scan's relation
+
+A scan can be *restricted* to an allow-list of its files (Phase 5b: a copy-on-write
+rewrite reads exactly the files it replaces); a plan that would not read every allowed
+file -- icetl's pruning dropped one -- is Uncuttable, never quietly narrower.
 
 Every table *reference* is its own split input, so a self-join reads its table twice,
 in two stages, and a stage never binds two file lists to one icetl parameter. A stage's
@@ -108,6 +116,7 @@ if TYPE_CHECKING:
     from icefleet.write.target import WriteTarget
 
 __all__ = [
+    "FILE_COLUMN",
     "Fetch",
     "Stage",
     "StageInput",
@@ -117,6 +126,9 @@ __all__ = [
 ]
 
 _INPUT_PREFIX = "__icefleet_input_"
+
+#: The column a file probe adds to its scan's relation: the data file a row came from.
+FILE_COLUMN = "__icefleet_file"
 
 #: Runs a query on the coordinator: (sql, parameters) -> rows. A range sort's boundaries.
 Fetch = Callable[[str, Mapping[str, Any]], list[tuple[Any, ...]]]
@@ -523,6 +535,8 @@ class _Planner:
         describe: Describe,
         register: Callable[[str, Any], None],
         aggregate_names: Collection[str],
+        restrict: Mapping[str, frozenset[str]] | None = None,
+        file_key: str | None = None,
     ) -> None:
         self.sources = sources
         self.scans = scans
@@ -531,6 +545,8 @@ class _Planner:
         self._describe = describe
         self.register = register
         self.aggregate_names = aggregate_names
+        self.restrict = dict(restrict or {})  # scan key -> the only files it may read
+        self.file_key = file_key  # the scan whose relation carries FILE_COLUMN
         self.stages: list[Stage] = []
         self.schemas: dict[str, list[tuple[str, str]]] = {}  # placeholder -> columns as written
         self._splits: dict[str, tuple[Split, ...]] = {}
@@ -577,8 +593,11 @@ class _Planner:
     def splits(self, key: str) -> tuple[Split, ...]:
         if key not in self._splits:
             scan = self.scans[key]
+            paths = list(scan.groups[0].paths)
+            if key in self.restrict:
+                paths = [p for p in paths if p in self.restrict[key]]
             self._splits[key] = plan_splits(
-                file_weights(scan, list(scan.groups[0].paths)),
+                file_weights(scan, paths),
                 target_bytes=self.fleet.split_target_bytes,
                 min_splits=self.min_splits,
                 max_splits=self.fleet.split_max,
@@ -599,11 +618,18 @@ class _Planner:
             raise _Refused("a stage would read more than one table reference")
         scan = self.scans[scan_key]
         parameters: dict[str, Any] = {}
-        bound = substitute_sources(
-            tree,
-            self.sources,
-            lambda source: build_source(scan, parameters=parameters, register=self.register),
-        )
+
+        def relation(source: Any) -> exp.Expression:
+            built = build_source(scan, parameters=parameters, register=self.register)
+            if scan_key == self.file_key:
+                if not isinstance(built, exp.Select):  # pragma: no cover - one group, files
+                    raise _Refused("a file probe over a scan that is not one read_parquet")
+                built = built.select(
+                    exp.alias_(exp.column("filename"), FILE_COLUMN, quoted=True), copy=False
+                )
+            return built
+
+        bound = substitute_sources(tree, self.sources, relation)
         parameter = f"{scan.source.view}_paths_0"
         if set(parameters) != {parameter}:
             raise _Refused(
@@ -1575,12 +1601,17 @@ def plan_stages(
     udf_names: Collection[str] = (),
     aggregate_names: Collection[str] = (),
     write: WriteTarget | None = None,
+    restrict: Mapping[str, frozenset[str]] | None = None,
+    probe: str | None = None,
 ) -> StagePlan | Uncuttable:
     """Cut `compiled` into stages, or say why it cannot be cut. With `write`, the final
     stages write the result into that table instead of returning it (Phase 5).
 
     `describe` types a SELECT over the plan's sources (DuckDB's DESCRIBE against icetl's
     zero-row views); `aggregate_names` is DuckDB's catalog of aggregate functions.
+    `restrict` limits a scan (by source key) to those of its files; `probe` (a source
+    key) plans the query -- a filter over that one scan -- as the distinct files holding
+    a row it keeps, in the single column FILE_COLUMN (Phase 5b).
     """
     optimized = compiled.optimized
     if optimized is None:
@@ -1607,6 +1638,11 @@ def plan_stages(
                 "files with renamed or late-added columns need per-group field-id "
                 "aliasing -- Phase 7"
             )
+        allowed = (restrict or {}).get(node.key)
+        if allowed is not None and not allowed <= set(scan.groups[0].paths):
+            # A rewrite replaces exactly the files it reads; one it would not read
+            # would lose its rows (Phase 5b).
+            return Uncuttable("the rewrite would not read every data file it replaces")
         scans[node.key] = scan
 
     def typed(tree: exp.Expression) -> list[tuple[str, str]]:
@@ -1623,8 +1659,12 @@ def plan_stages(
         describe=typed,
         register=register,
         aggregate_names=aggregate_names,
+        restrict=restrict,
+        file_key=probe,
     )
     try:
+        if probe is not None:
+            return _plan_probe(planner, query, probe)
         if write is not None:
             return _plan_write(planner, query, list(output_names), write)
         return _plan(planner, query, list(output_names))
@@ -1805,7 +1845,11 @@ def _plan_write(
 
     pipe = planner.each(root, shaped)
     shown = "-> Iceberg data files"
-    if target.partitions:
+    if target.partitions and not target.shuffle:
+        # A rewrite whose rows stay in their partition (Phase 5b): every task reads whole
+        # files of one partition each, so it writes a file per value it holds.
+        shown += ", a file per partition value per task"
+    elif target.partitions:
         types = [kind for name, kind in planner.describe_pipe(pipe) if name in hidden]
         n = planner.fleet.shuffle_partitions
         pipe = planner.shuffle(
@@ -1834,4 +1878,41 @@ def _plan_write(
         columns=tuple(name for name, _ in target.columns),
         final_stages=tuple(s.stage_id for s in finals),
         write=target,
+    )
+
+
+def _plan_probe(planner: _Planner, query: Query, key: str) -> StagePlan | Uncuttable:
+    """The files of scan `key` holding a row the query's filter keeps (Phase 5b).
+
+    Only a filter straight over the scan is probed -- `SELECT ... FROM t WHERE ...`, one
+    stage, no join, no aggregate -- because only there is every row still a row of one
+    file. Each task writes the distinct file names of its split; the coordinator reads
+    them all. Anything else is Uncuttable, and the caller rewrites every candidate file.
+    """
+    if query.order or query.limit is not None or query.offset:
+        return Uncuttable("a file probe with an ORDER BY or a LIMIT")
+    pipe = planner.plan(query.root)
+    if pipe.branches or pipe.inputs or pipe.scan != key or not isinstance(pipe.body, exp.Select):
+        return Uncuttable("a file probe that is not a filter over the one table")
+    select = pipe.body
+    relation = from_of(select)
+    if not isinstance(relation, exp.Table) or select.args.get("joins") or select.args.get("group"):
+        return Uncuttable("a file probe that is not a filter over the one table")
+    probe = select.copy()
+    probe.set(
+        "expressions",
+        [_alias(_column(FILE_COLUMN, relation_alias(relation)), FILE_COLUMN)],
+    )
+    probe.set("distinct", exp.Distinct())
+    final = planner.close(
+        probe,
+        pipe,
+        sink="result",
+        partitions=1,
+        notes=(*pipe.notes, "-> the data files holding a row it changes"),
+    )
+    return StagePlan(
+        stages=tuple(planner.stages),
+        columns=(FILE_COLUMN,),
+        final_stages=(final.stage_id,),
     )

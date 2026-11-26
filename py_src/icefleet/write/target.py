@@ -61,6 +61,10 @@ class WriteTarget:
     transformed: bool  # some partition field is not identity (no dynamic overwrite)
     location: str  # where the tasks write: <table location>/data/icefleet, as DuckDB spells it
     target_file_bytes: int
+    #: Shuffle a partitioned table's rows by their partition values before writing. A
+    #: copy-on-write rewrite whose rows cannot change partition turns it off (Phase 5b):
+    #: each task then reads whole files of one partition and writes a file per value.
+    shuffle: bool = True
 
     @property
     def hidden(self) -> tuple[str, ...]:

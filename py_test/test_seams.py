@@ -124,3 +124,51 @@ def test_the_write_seams() -> None:
     ]
     for method in ("_invalidate_source",):
         assert hasattr(Session, method), method
+
+
+def test_the_row_level_seams() -> None:
+    """Phase 5b overrides `Session._row_level` and builds on icetl's row-level planner's
+    private helpers; the file replacement uses PyIceberg's private footer reader."""
+    from icetl.plan import pushdown
+    from icetl.sql import rowlevel
+    from pyiceberg import table as iceberg_table
+    from pyiceberg.table.update import snapshot
+
+    assert params(Session._row_level) == ["self", "plan"]
+    for method in ("_inline_temp_views", "_frame_for", "_empty_frame", "_resolver"):
+        assert hasattr(Session, method) or method in inspect.getsource(Session.__init__), method
+    expected = {
+        "_resolve_target": ["session", "node"],
+        "_where": ["plan"],
+        "_assignments": ["items", "target"],
+        "_whens": ["plan", "target", "source_alias", "source_columns"],
+        "_key_pairs": ["terms", "target", "source_alias"],
+        "_distinct_values": ["session", "source", "expression"],
+        "_clause_projections": ["target", "clauses"],
+        "_survives": ["clauses"],
+        "_restrict": ["select", "conditions"],
+        "_aliased": ["node", "alias"],
+        "_columns_of": ["session", "source"],
+        "_qualified": ["alias", "column"],
+        "_is_true": ["condition"],
+        "_all_of": ["terms"],
+        "run_delete": ["session", "plan"],
+        "run_update": ["session", "plan"],
+        "run_merge": ["session", "plan"],
+    }
+    for name, arguments in expected.items():
+        assert params(getattr(rowlevel, name)) == arguments, name
+    assert isinstance(rowlevel._ATTEMPTS, int) and isinstance(rowlevel._BACKOFF_SECONDS, float)
+    target = {f.name for f in dataclasses.fields(rowlevel._Target)}
+    assert {"node", "alias", "columns", "resolver", "snapshot_id"} <= target
+    when = {f.name for f in dataclasses.fields(rowlevel._When)}
+    assert {"kind", "action", "condition", "assignments", "inserts"} <= when
+    assert params(pushdown.scope_predicate) == ["terms", "resolver", "schema", "exact_only"]
+    assert hasattr(pushdown.ColumnResolver, "owns_every_column")
+    assert params(iceberg_table._parquet_files_to_data_files) == [
+        "table_metadata",
+        "file_paths",
+        "io",
+    ]
+    for method in ("delete_data_file", "append_data_file"):
+        assert hasattr(snapshot._OverwriteFiles, method), method

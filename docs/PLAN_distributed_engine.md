@@ -1,6 +1,6 @@
 # icefleet — a distributed SQL and DataFrame engine over Apache Iceberg, executed by a fleet of DuckDB workers
 
-**Status:** Draft v1.7 — 2026-11-18, decisions locked (§2); v1.1 adds decision 26 (HTTP control plane) and decision 27 (Kubernetes + Argo Workflows as the deployment target); v1.2 adds decision 28 (development in a Linux dev container); v1.3 records Phase 1 as built (§6), corrects §4.6 (DuckDB writes field ids) and extends the seam table (§4.10); v1.4 records Phase 2 as built (§6), corrects §4.1 (DuckDB hashes integers by width) and §4.4 (shuffle files are not rolled), extends §4.10 and §5; v1.5 records Phase 3 as built (§6), corrects §4.3 (join strategy chosen when planning, from upper bounds) and §4.4 (broadcast), updates §5; v1.6 records Phase 4 as built (§6), extends §4.4 (range sort, samples) and §5, and replaces §4.2's grouping-set row (one shuffle, not one per set); v1.7 records Phase 5 as built (§6), §4.6 as built (one commit, not one snapshot; time transforms), extends §4.10 and §5
+**Status:** Draft v1.8 — 2026-11-18, decisions locked (§2); v1.1 adds decision 26 (HTTP control plane) and decision 27 (Kubernetes + Argo Workflows as the deployment target); v1.2 adds decision 28 (development in a Linux dev container); v1.3 records Phase 1 as built (§6), corrects §4.6 (DuckDB writes field ids) and extends the seam table (§4.10); v1.4 records Phase 2 as built (§6), corrects §4.1 (DuckDB hashes integers by width) and §4.4 (shuffle files are not rolled), extends §4.10 and §5; v1.5 records Phase 3 as built (§6), corrects §4.3 (join strategy chosen when planning, from upper bounds) and §4.4 (broadcast), updates §5; v1.6 records Phase 4 as built (§6), extends §4.4 (range sort, samples) and §5, and replaces §4.2's grouping-set row (one shuffle, not one per set); v1.7 records Phase 5 as built (§6), §4.6 as built (one commit, not one snapshot; time transforms), extends §4.10 and §5; v1.8 records Phase 5b as built (§6), adds §4.6's copy-on-write rewrite, extends §4.10 and §5
 **Owner:** Arun
 **Base:** [`icetl`](https://github.com/marun224/data_transformation_engine) 0.1.0 — single-node, sqlglot IR, PyIceberg planning, DuckDB execution. Local checkout: `E:\workspace\Transformation_Engine_08172026`.
 **State of the work:** [task_tracker.md](task_tracker.md). This file is the design; it does not say what is done.
@@ -458,6 +458,28 @@ Why field ids matter enough to write them ourselves: DuckDB's `COPY` does not wr
 > icetl's writer. "One snapshot" (step 4) is one **commit**: an append is one snapshot,
 > an overwrite or a dynamic overwrite a delete and an append in one transaction -- the
 > same two snapshots icetl's own overwrite makes (kickoff answer 4).
+>
+> **As built, Phase 5b (2026-11-18): row-level operations rewrite files, not rows.**
+> icetl's `DELETE` / `UPDATE` / `MERGE` compute the rows in scope on the coordinator and
+> commit `overwrite(rows, overwrite_filter=P)`, which is right only while the Iceberg
+> filter `P` and the SQL select exactly the same rows, and which has PyIceberg rewrite
+> every partly matching file on the coordinator. icefleet's unit is the file
+> (`write/rowlevel.py`): (1) the candidate files are Iceberg's pruning at the planned
+> snapshot, narrowed by a distributed **probe** -- `SELECT DISTINCT filename` over the
+> target-only conjuncts, DuckDB's virtual column added to that one scan's relation -- to
+> the files holding a row the statement changes; (2) the workers rewrite those files
+> *whole*, every row through the statement's SQL (`DELETE`: `WHERE NOT COALESCE(c,
+> FALSE)`; `UPDATE`: `CASE WHEN c THEN new ELSE old END`; `MERGE`: icetl's three halves
+> with `EXISTS` spelled as `LEFT SEMI` / `LEFT ANTI JOIN`, one `UNION ALL`), reading the
+> target `VERSION AS OF` the planned snapshot and **pinned** to exactly those files (a
+> plan that would not read one of them is refused); (3) one OVERWRITE snapshot swaps
+> them (`replace_files`: `update_snapshot().overwrite()` with `delete_data_file` /
+> `append_data_file`) on the table object as planned, so PyIceberg's
+> `AssertRefSnapshotId` refuses a commit that lost a race and the statement is planned
+> again. Because SQL writes every row of a replaced file, the Iceberg filter only picks
+> files and may be inexact. A `DELETE` PyIceberg answers from metadata (no condition, or
+> an exact one over identity partition columns, all touched files of the current spec)
+> stays icetl's.
 
 ### 4.7 Semantics under distribution
 
@@ -506,6 +528,9 @@ Overridden (private, which is why the pin is exact):
 | `Session._analyzer.connection` *(Phase 2, wider use)* | `DESCRIBE` types every stage (keys, partials, each aggregate as it is single-node); `duckdb_functions()` lists DuckDB's aggregates, because sqlglot leaves some (`list`) as scalar functions | part of the `Executor` context |
 | `DataFrame.write`, `DataFrameWriter._save` / `_derive` and its settings *(Phase 5)* | the property is wrapped at import (frames of a `ClusterSession` get `ClusterDataFrameWriter`); `_save` is replaced, `_derive` overridden because icetl's hard-codes `DataFrameWriter(...)`; `_merges_schema`, `_dynamic_partitions`, `_apply_partitioning` / `_apply_sort_order` reused | icetl 0.2.0: `Session._writer_class` (already listed above) |
 | PyIceberg's `_check_pyarrow_schema_compatible` *(Phase 5)* | run on the frame's zero-row Arrow schema before writing, so the distributed writer accepts and refuses exactly what icetl's append does | a public schema-compatibility check in PyIceberg, or icetl exposing its own |
+| `Session._row_level` *(Phase 5b)* | overridden: `DELETE` / `UPDATE` / `MERGE` go to `write/rowlevel.py`; icetl's `run_delete` / `run_update` / `run_merge` are its fallback | icetl 0.2.0: a row-level hook on the `Executor` protocol |
+| `icetl.sql.rowlevel`'s private helpers *(Phase 5b)* | `_resolve_target`, `_Target`, `_When`, `_where`, `_assignments`, `_whens`, `_clause_projections`, `_survives`, `_restrict`, `_key_pairs`, `_distinct_values`, `_aliased`, `_columns_of`, `_qualified`, `_is_true`, `_all_of`, `_ATTEMPTS`, `_BACKOFF_SECONDS` reused, so parsing, clause semantics and errors stay icetl's; `plan.pushdown.scope_predicate` / `conjuncts` | icetl 0.2.0: a public row-level planner returning the rewrite *query* rather than running it |
+| PyIceberg's `_parquet_files_to_data_files` and `_OverwriteFiles` *(Phase 5b)* | the footers of the written files read as `add_files` reads them, then one overwrite that deletes and appends named data files | a public "replace files" API in PyIceberg |
 
 Each upstream hook is a small, additive PR to the icetl repo and a version bump of the pin. Until then: `icetl==0.1.0`, and `py_test/test_seams.py` asserts every private attribute icefleet touches still exists with the expected signature, so a pin bump fails loudly rather than mysteriously.
 
@@ -553,8 +578,9 @@ py_src/icefleet/
     sinks.py             shuffle / result / iceberg_files writers
   write/
     target.py            a table as a write target: column types, field ids, partition grouping (Phase 5)
-    commit.py            add_files + delete in one transaction, commit_with_retry
+    commit.py            add_files + delete in one transaction, commit_with_retry; replace_files (5b)
     writer.py            ClusterDataFrameWriter: icetl's writer, writing from the workers
+    rowlevel.py          DELETE / UPDATE / MERGE: copy-on-write, file by file (Phase 5b)
 py_test/
   conftest.py            local[N] cluster fixture, SqlCatalog warehouse, oracle session
   fixtures/generator.py  fixture tables (adapted from icetl's)
@@ -562,7 +588,7 @@ py_test/
   cluster/               end-to-end on local[N] against the oracle
   integration/           REST catalog + MinIO, later the dev Kubernetes cluster (-m integration)
 docs/                    this plan · task_tracker.md · commands.md · workflow · divergence.md · findings.md
-scripts/                 dev.ps1 · wheelhouse.ps1 (decision 28) · smoke_cluster.py (Phase 1) · benchmark.py (Phase 6)
+scripts/                 dev.ps1 · wheelhouse.ps1 (decision 28) · smoke_cluster.py (Phase 1) · smoke_write.py (5) · smoke_rowlevel.py (5b) · benchmark.py (Phase 6)
 deploy/
   dev/                   the dev container (decision 28): Dockerfile · compose.yml · devrun.sh · devsetup.sh
   Dockerfile             one image: icefleet-worker serve | run-task | the coordinator script
@@ -835,7 +861,47 @@ a feeling.
   source, and every write made one file per partition value it wrote. Both tables
   purged at the end; `nyc.yellow_tripdata`'s metadata untouched.
 
-**Phase 5b — row-level operations.** `DELETE`/`UPDATE`/`MERGE` through icetl's row-level planner with the rows produced distributed and committed via `write/commit.py`.
+### Phase 5b — Row-level operations
+
+`DELETE`/`UPDATE`/`MERGE` through icetl's row-level planner with the rows produced distributed and committed via `write/commit.py`.
+
+**As built (2026-11-18).** Where the build differs from the line above or adds to it:
+
+- **Kickoff answers (owner, "yes to all"):** (1) SQL `DELETE` / `UPDATE` / `MERGE INTO`
+  as icetl has them, copy-on-write, icetl's refusals kept (`DELETE ... USING`, `UPDATE
+  ... FROM`, a nested `SET`); (2) files rewritten whole on the workers, not rows
+  collected on the coordinator; (3) **one snapshot per statement**, a `DELETE` PyIceberg
+  answers from metadata left to it; (4) a distributed probe so only files holding a
+  matching row are rewritten; (5) no partition shuffle unless rows can change partition
+  (an `UPDATE` / `MERGE` assigning a partition source column, `MERGE` inserts); (6) the
+  commit on the planned snapshot, a lost race re-planned up to 4 times, its files
+  deleted; (7) `MERGE` with semi / anti joins and icetl's rules, an insert-only `MERGE` an
+  append, and an `INSERT` naming some columns typed rather than failing; (8) what cannot
+  be distributed on icetl's planner, logged, refused under `icefleet.fallback=error`; (9)
+  twin-table tests and a proof of life on a month of trips.
+- **Not "icetl's planner with distributed rows"**: icetl's planner is kept for parsing,
+  clause semantics and errors (its private helpers, §4.10), but its commit -- rows
+  swapped by a filter -- is replaced by files swapped by name (§4.6, as built 5b). The
+  rewrite runs on Phase 5's sink (`write/target.py`), with `WriteTarget.shuffle` off when
+  no row can change partition: each task then writes a file per partition value it holds.
+- **The planner gained two things** (`plan/stages.py`): a scan **restricted** to an
+  allow-list of its files (`ClusterSession._pinning`; a plan that would not read one of
+  them is Uncuttable), and a **file probe** (`plan_stages(probe=key)`: a filter over one
+  scan, its relation carrying DuckDB's `filename` as `__icefleet_file`).
+- **`MERGE`'s scope** is icetl's (target-only `ON` conjuncts, an `IN` list of the source's
+  key values up to 1000), without icetl's last step, which keeps only exactly
+  translatable terms: here a term only picks files, so a date `IN` list narrows too.
+- **Empty files** (an unpartitioned task with no rows still writes one) are now deleted by
+  the coordinator (`Exchange.delete_files`) instead of left uncommitted in the table's
+  folder -- Phase 5's known gap, which `MERGE`'s anti-join halves made common.
+- **Proof of life** (`scripts/smoke_rowlevel.py`, `icefleet_it` only): January 2024 of
+  `nyc.yellow_tripdata`, 2,964,617 rows in twin tables partitioned by `pickup_date`. A
+  `DELETE` of the trips over 50 miles (all 31 files hold one; 2.2 s against icetl's 3.5
+  s); an `UPDATE` of one day's card trips (1 of 31 files replaced); a `MERGE` of one
+  day's fares by zone from a source read off the table itself, inserting the zones only
+  the next day has (1 of 31 files; 13.0 s against icetl's 5.3 s -- its source, a `GROUP
+  BY`, runs in every planning query on 61 small tasks). Each step one OVERWRITE snapshot,
+  per-day counts and sums equal to icetl's twin; both tables purged.
 
 ### Phase 6 — The image, Kubernetes, Argo fleet-per-workflow, integration tier, benchmarks
 

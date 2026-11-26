@@ -13,6 +13,8 @@ from typing import TYPE_CHECKING, Any
 from icefleet.exchange.base import Exchange
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
     from icetl.conf import S3Settings
 
 __all__ = ["ObjectStoreExchange", "s3_filesystem"]
@@ -72,4 +74,11 @@ class ObjectStoreExchange(Exchange):
         prefix = _key(self.query_prefix(query_id))
         with contextlib.suppress(FileNotFoundError):  # nothing written, nothing to remove
             self._fs.rm(prefix, recursive=True)
+        self._fs.invalidate_cache()
+
+    def delete_files(self, paths: Sequence[str]) -> None:
+        if not paths:
+            return
+        with contextlib.suppress(FileNotFoundError):
+            self._fs.rm([_key(p) for p in paths])
         self._fs.invalidate_cache()

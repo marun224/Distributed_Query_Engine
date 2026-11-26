@@ -17,6 +17,15 @@ Differences from icetl, chosen (not distribution's):
 - **A failed `saveAsTable` leaves no table** (Phase 5, kickoff answer 5): a table the write
   created is dropped again when filling it fails, as the reference does. icetl leaves
   the empty table it created. A table that existed before is never dropped.
+- **A distributed `DELETE` / `UPDATE` / `MERGE` makes one snapshot** (Phase 5b, kickoff
+  answer 3): an OVERWRITE that swaps the files it rewrote. icetl's makes two (a delete,
+  then an append), except a `DELETE` PyIceberg answers itself, which makes one in both.
+  The table's rows are the same; only its history is shorter.
+- **A `MERGE ... WHEN NOT MATCHED THEN INSERT (some columns)` succeeds** (Phase 5b,
+  kickoff answer 7): the columns it leaves out are written as NULLs of their own type.
+  icetl writes them as untyped NULLs -- integers to DuckDB -- and its cast to a
+  `timestamp` or `decimal` column then fails the statement. When the statement runs on
+  icetl's planner instead (a fallback), icetl's error is what it gets.
 
 Not divergences, by construction:
 
@@ -33,6 +42,11 @@ Not divergences, by construction:
   check runs first -- create tables with icetl's schema (the same Arrow types, through
   `iceberg_ready`), and make icetl's snapshots: an append one, an overwrite a delete and
   an append.
+- **Row-level operations** (Phase 5b) leave icetl's rows: every row of a replaced file is
+  written back through the statement's SQL -- icetl's own clause logic, `NOT
+  COALESCE(c, FALSE)` for a `DELETE`, a `CASE` per column for an `UPDATE` -- so a row
+  whose condition is NULL is kept, as in icetl, and the Iceberg filter only picks files.
+  A `MERGE` matching one target row to two source rows is refused, as icetl refuses it.
 - **NULL join keys** (Phase 3) never match under `=` and always match under
   `IS NOT DISTINCT FROM`, as single-node; a row an outer join keeps for a NULL key is
   emitted once, by the one task its partition went to. Only a side whose unmatched rows

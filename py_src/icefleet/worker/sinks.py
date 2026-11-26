@@ -1,4 +1,4 @@
-"""Where a task's rows go: the `result` and `shuffle` sinks; Iceberg data files are Phase 5.
+"""Where a task's rows go: the `result` and `shuffle` sinks, and Iceberg data files (Phase 5).
 
 One `COPY` statement does the work (P4: DuckDB moves the bytes). `RETURN_STATS` hands back
 every file written with its row count and size, which is the task's manifest -- no
@@ -130,8 +130,9 @@ def write_iceberg_files(
     `partition_columns`, rows are written one directory per value of those computed
     grouping columns, which are left out of the files: every file holds one partition,
     which is what `add_files` reads its partition value from. Without, the rows roll
-    into files of `target_file_bytes`. A file with no rows is not reported: it is not
-    worth a manifest entry.
+    into files of `target_file_bytes`. An unpartitioned task with no rows still writes
+    one empty file; it is reported with its 0 rows, so the coordinator, which commits
+    only files holding rows, deletes it rather than leaving it in the table's folder.
     """
     location = sink.location
     _prepare(location)
@@ -146,8 +147,4 @@ def write_iceberg_files(
     options.append("RETURN_STATS true")
     copy = f"COPY ({sql}) TO {_quote(location)} ({', '.join(options)})"
     rows = cursor.execute(copy, dict(parameters)).fetchall()
-    return [
-        OutputFile(path=str(row[0]), rows=int(row[1]), bytes=int(row[2]))
-        for row in rows
-        if int(row[1]) > 0
-    ]
+    return [OutputFile(path=str(row[0]), rows=int(row[1]), bytes=int(row[2])) for row in rows]

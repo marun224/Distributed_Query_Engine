@@ -15,9 +15,10 @@ from pyiceberg import types as t
 from pyiceberg.exceptions import CommitFailedException
 from pyiceberg.schema import Schema
 
+from icefleet.exchange import open_exchange
 from icefleet.plan.tasks import SinkSpec
 from icefleet.worker.sinks import write_iceberg_files
-from icefleet.write.commit import commit_files, partition_filter
+from icefleet.write.commit import commit_files, partition_filter, replace_files
 from icefleet.write.target import _partition_value, duckdb_type, field_ids_of, iceberg_path
 
 # -- partition values: DuckDB's grouping equals Iceberg's transform ----------------------
@@ -191,12 +192,76 @@ def test_data_files_carry_field_ids_one_directory_per_partition(tmp_path: Path) 
         assert len(values) == 1  # one partition per file
 
 
-def test_an_empty_task_reports_no_file(tmp_path: Path) -> None:
+def test_an_empty_task_reports_its_empty_file_for_the_coordinator_to_delete(
+    tmp_path: Path,
+) -> None:
     con = duckdb.connect()
     sink = SinkSpec(
         kind="iceberg_files", location=(tmp_path / "e").as_posix(), field_ids='{"id": 1}'
     )
-    assert write_iceberg_files(con.cursor(), "SELECT 1::BIGINT AS id WHERE FALSE", {}, sink) == []
+    files = write_iceberg_files(con.cursor(), "SELECT 1::BIGINT AS id WHERE FALSE", {}, sink)
+    assert [f.rows for f in files] == [0]
+    exchange = open_exchange(tmp_path.as_posix())
+    exchange.delete_files([f.path for f in files])
+    assert list((tmp_path / "e").rglob("*.parquet")) == []
+    exchange.delete_files([f.path for f in files])  # already gone: not an error
+
+
+def _three_file_table(tmp_path: Path) -> Any:
+    import pyarrow as pa
+    from pyiceberg.catalog.sql import SqlCatalog
+    from pyiceberg.types import LongType, NestedField
+
+    catalog = SqlCatalog(
+        "unit", uri=f"sqlite:///{tmp_path}/c.db", warehouse=f"file://{tmp_path}/wh"
+    )
+    catalog.create_namespace("u")
+    table = catalog.create_table("u.t", Schema(NestedField(1, "id", LongType(), required=False)))
+    for low in (0, 10, 20):
+        table.append(pa.table({"id": pa.array(range(low, low + 10), pa.int64())}))
+    return catalog, catalog.load_table("u.t")
+
+
+def _data_file(con: Any, table: Any, name: str, sql: str) -> str:
+    folder = next(iter(table.scan().plan_files())).file.file_path.removeprefix("file://")
+    path = f"{folder.rsplit('/', 1)[0]}/{name}.parquet"
+    con.execute(f"COPY ({sql}) TO '{path}' (FORMAT parquet, FIELD_IDS {{id: 1}})")
+    return f"file://{path}"
+
+
+def test_replacing_files_is_one_overwrite_snapshot(tmp_path: Path) -> None:
+    catalog, table = _three_file_table(tmp_path)
+    victim = min((task.file for task in table.scan().plan_files()), key=lambda f: f.file_path)
+    kept = victim.file_path
+    new = _data_file(duckdb.connect(), table, "new", "SELECT 1000::BIGINT AS id")
+    replace_files(table, [victim], [new])
+    after = catalog.load_table("u.t")
+    assert len(after.snapshots()) == 4
+    assert after.current_snapshot().summary.operation.value == "overwrite"
+    paths = {task.file.file_path for task in after.scan().plan_files()}
+    assert new in paths and kept not in paths and len(paths) == 3
+
+
+def test_replacing_files_refuses_a_table_that_moved(tmp_path: Path) -> None:
+    import pyarrow as pa
+
+    catalog, planned = _three_file_table(tmp_path)
+    catalog.load_table("u.t").append(pa.table({"id": pa.array([99], pa.int64())}))
+    victim = next(iter(planned.scan().plan_files())).file
+    new = _data_file(duckdb.connect(), planned, "late", "SELECT 1::BIGINT AS id")
+    with pytest.raises(CommitFailedException):
+        replace_files(planned, [victim], [new])
+
+
+def test_replacing_nothing_appends_or_commits_nothing(tmp_path: Path) -> None:
+    catalog, table = _three_file_table(tmp_path)
+    replace_files(table, [], [])
+    assert len(catalog.load_table("u.t").snapshots()) == 3
+    new = _data_file(duckdb.connect(), table, "added", "SELECT 7::BIGINT AS id")
+    replace_files(table, [], [new])
+    after = catalog.load_table("u.t")
+    assert after.current_snapshot().summary.operation.value == "append"
+    assert after.scan().to_arrow().num_rows == 31
 
 
 def test_the_sink_round_trips_in_a_task_spec() -> None:

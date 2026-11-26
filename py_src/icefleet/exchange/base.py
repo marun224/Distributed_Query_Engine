@@ -17,6 +17,8 @@ from typing import TYPE_CHECKING
 from icetl.paths import is_object_store
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
     from icetl.conf import S3Settings
 
 __all__ = ["Exchange", "open_exchange"]
@@ -42,6 +44,10 @@ class Exchange(ABC):
     @abstractmethod
     def delete_query(self, query_id: str) -> None:
         """Remove everything a query wrote. Idempotent: an absent prefix is not an error."""
+
+    @abstractmethod
+    def delete_files(self, paths: Sequence[str]) -> None:
+        """Remove these files (as DuckDB reported writing them). An absent one is fine."""
 
     def describe(self) -> str:
         return self.location
