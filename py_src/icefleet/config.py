@@ -72,7 +72,12 @@ Fallback = Literal["single-node", "error"]
 
 @dataclass(frozen=True)
 class FleetSettings:
-    """The resolved `icefleet.*` settings. Defaults are placeholders until Phase 6 measures."""
+    """The resolved `icefleet.*` settings.
+
+    `shuffle_partitions` was measured in Phase 6 (docs/BENCHMARKS.md): 16 beat 64 on every
+    wide shuffle, on `local[3]` and on the Argo fleet. The other defaults are unchanged:
+    no measurement in Phase 6 clearly beat them.
+    """
 
     master: str = "local[2]"
     exchange_location: str | None = None
@@ -80,7 +85,7 @@ class FleetSettings:
     fallback: Fallback = "single-node"
     split_target_bytes: int = 128 * MiB
     split_max: int = 4096
-    shuffle_partitions: int = 64
+    shuffle_partitions: int = 16
     broadcast_threshold_bytes: int = 64 * MiB
     sort_coordinator_bytes: int = 64 * MiB
     sort_sample_rows: int = 1000

@@ -16,6 +16,7 @@ from collections import defaultdict
 from typing import TYPE_CHECKING, Any
 
 import duckdb
+from icetl.paths import is_object_store
 
 from icefleet.plan.tasks import TaskResult
 from icefleet.worker.sinks import write_iceberg_files, write_result, write_shuffle
@@ -30,6 +31,14 @@ __all__ = ["TaskCancelled", "TaskFailed", "TaskRunner"]
 logger = logging.getLogger(__name__)
 
 MAX_REMEMBERED_CANCELLATIONS = 4096
+
+#: DuckDB's httpfs sizes an S3 upload part as `s3_uploader_max_filesize` / 10,000 parts.
+#: Its default (800GB) makes every open S3 file buffer ~76 MiB, and a shuffle task holds
+#: one open file per partition: 64 of them overran a 1 GiB worker (Phase 6, the Compose
+#: smoke test). Measured with a 64-way COPY of 25M rows, 2 slots, `memory_limit` 1GB:
+#: 800GB and 80GB fail, 50GB (5 MB parts, S3's minimum) passes. Nothing icefleet writes
+#: approaches 50GB. 64 open files x 2 slots still hold ~640 MB of upload buffers.
+S3_MAX_FILE_SIZE = "50GB"
 
 
 class TaskFailed(Exception):
@@ -51,6 +60,19 @@ class TaskRunner:
         # Insertion-ordered, so the oldest cancellations can be forgotten: a long-lived
         # worker must not grow without bound, and query ids are never reused.
         self._cancelled: dict[str, None] = {}
+        self._s3_tuned = False
+
+    def _object_store(self, locations: list[str]) -> None:
+        """Load httpfs (icetl's engine) if a location needs it, then size S3 uploads once."""
+        self._engine.ensure_object_store(locations)
+        if self._s3_tuned or not any(is_object_store(location) for location in locations):
+            return
+        with self._lock:
+            if not self._s3_tuned:
+                self._engine.connection.execute(
+                    f"SET GLOBAL s3_uploader_max_filesize = '{S3_MAX_FILE_SIZE}'"
+                )
+                self._s3_tuned = True
 
     def run(self, spec: TaskSpec) -> TaskResult:
         for name, source in spec.inputs.items():
@@ -60,7 +82,7 @@ class TaskRunner:
                 raise TaskFailed(f"{spec.key}: input {name!r} has no files")
 
         locations = [p for source in spec.inputs.values() for p in source.paths]
-        self._engine.ensure_object_store([*locations, spec.sink.location])
+        self._object_store([*locations, spec.sink.location])
         cursor = self._engine.cursor()
         parameters = {name: list(source.paths) for name, source in spec.inputs.items()}
 

@@ -9,13 +9,13 @@ Update at the end of every session. Design lives in
 | | |
 |---|---|
 | Last updated | 2026-11-26 |
-| Current phase | **Phase 5b — done and confirmed** (owner, 2026-11-26: "Confirm, commit + push", after the gate was re-run green). Phase 6 not started: it waits for its kickoff questions |
+| Current phase | **Phase 6 — built except the integration tier's first run** (kickoff "yes to all" 2026-11-26). Done: worker memory check, S3 part-size fix, offline image, Compose smoke, k8s/Argo manifests and scripts, model A, **the done-when queries on the Argo fleet**, benchmarks, default partitions 64 -> 16, docs, gate green (872). **Committed, not pushed.** Left: run the integration tier (6.10), then owner confirmation |
 | Working tree | Phase 5b committed on `main` and pushed (2026-11-26); see "Last updated (git)" |
 | On resume | 1. Read this tracker (Known gaps, Open decisions). 2. `.\scripts\dev.ps1 up` (start the `iceberg-nyc` catalog stack first if Docker restarted). 3. Read plan §6 Phase 6 and §3.5 in full. 4. Ask the owner the Phase 6 kickoff questions (incl. Docker Desktop Kubernetes vs the `kind` cluster, Argo install) |
 | Last updated (git) | 2026-11-16: Phase 1 committed (`fb937a7`) and pushed to the new **public** repo https://github.com/marun224/Distributed_Query_Engine (`origin`, `main` tracks `origin/main`). **Phase 2 committed on `main`** at the owner's request ("pls commit phase 2", 2026-11-16; `88fc616`). **Pushed:** checked 2026-11-18 with `git ls-remote`, GitHub's `main` is `88fc616`. **Phase 3 committed on `main`** at the owner's request ("pls commit pahse 3 changes", 2026-11-18; the commit after `88fc616`, see `git log`). **Not pushed.** **Phase 4 committed on `main`** at the owner's request ("pls commit phase 4 chnages to git", 2026-11-18; `8325d38`). **Phases 3 and 4 pushed** 2026-11-18 at the owner's request ("pls push"): GitHub's `main` is `8325d38` (checked with `git ls-remote`). **Phase 5 committed and pushed** at the owner's request ("pls commit and psuh pahse 5 chnages", 2026-11-18): `7825cc5`, `main` == `origin/main`. **Phase 5b committed and pushed** at the owner's request ("Confirm, commit + push", 2026-11-26): the commit after `7825cc5`, see `git log`; every 5b file staged from the working tree (several had been only partly staged) |
-| Next action | **Phase 6 kickoff questions** to the owner (plan §6 Phase 6, §3.5) |
-| Next phase | Phase 6 — image, Kubernetes, Argo fleet-per-workflow |
-| Blocked on | Owner: Phase 6 kickoff answers |
+| Next action | **Run the integration tier** (checklist 6.10: host, then in-cluster), then ask the owner to confirm Phase 6 and whether to push |
+| Next phase | Phase 6 — image, Kubernetes, Argo fleet-per-workflow (in progress: kickoff) |
+| Blocked on | Nothing; kubectl from Windows needs Windows' excluded port range freed (owner's: `winnat` restart or reboot) -- `docker exec` works meanwhile |
 | Gate | **Re-run green on 2026-11-26** on resume, working tree unchanged since the pause: lint · type · py312 856 passed (3 min 17 s) · dist, 214 s. **`.\scripts\dev.ps1 uv run tox` green on 2026-11-18** (Phase 5b): lint · type · py312 **856 passed** · dist, 204 s (tests 3 min 15 s, over plan §9's 3 minutes: Known gaps). Proof of life: `scripts/smoke_cluster.py` (eight read queries, Phase 4), `scripts/smoke_write.py` (five writes, Phase 5) and **`scripts/smoke_rowlevel.py` OK** -- a DELETE, an UPDATE and a MERGE on a month of trips in `icefleet_it`, each equal to icetl's twin. The Windows `.venv` gate is not authoritative (decision 28) |
 
 ## Phases
@@ -28,7 +28,7 @@ Update at the end of every session. Design lives in
 | 3 | Joins: broadcast and shuffle hash | **done** | 2026-11-18 | **yes, 2026-11-18** |
 | 4 | Windows, distributed ORDER BY (range partitioning), OFFSET, set operations, grouping sets | **done** | 2026-11-18 | **yes, 2026-11-18** |
 | 5 | Distributed writes, one commit; 5b row-level operations | **done** (5 and 5b) | 2026-11-18 | **5: yes, 2026-11-18** ("pls start pahse 5b"); **5b: yes, 2026-11-26** |
-| 6 | Container image, Kubernetes manifests, Argo fleet-per-workflow, integration tier, benchmarks (decision 27) | not started | — | — |
+| 6 | Container image, Kubernetes manifests, Argo fleet-per-workflow, integration tier, benchmarks (decision 27) | **kickoff** (questions asked 2026-11-26) | — | — |
 | 6b | Argo as a scheduler backend: pod per task (`ArgoScheduler`, `icefleet-worker run-task`) | not started | — | — |
 | 7 | Task retry (thread-pool backend), adaptive partitions, skew, renamed-column splits, `explain(analyze)` | not started | — | — |
 | 8 | Streaming exchange (Arrow IPC over HTTP), result streaming, Python UDFs, optional coordinator service | not started | — | — |
@@ -150,6 +150,28 @@ Update at the end of every session. Design lives in
 | 5b.8 | Docs: plan v1.8 (§4.6, §4.10, §5, §6 5b), `divergence.md`, README | **done** | |
 | 5b.9 | Owner confirms Phase 5b | **done** | 2026-11-26, "Confirm, commit + push" (after the gate was re-run green: 856 passed); committed and pushed |
 
+## Phase 6 checklist
+
+| # | Task | Status | Notes |
+|---|---|---|---|
+| 6.0 | Kickoff questions (10) answered | **done** | owner: "Yes to all" (2026-11-26); recorded in plan decision 29 and §6 Phase 6 "As built". The questions: (1) dev cluster: kind `temporal-poc` (recommended) vs Docker Desktop Kubernetes; (2) the kind node's lost host port mapping: one `docker restart` with the owner's OK (recommended) vs `docker exec` only; (3) own `icefleet` namespace with its own `argo-workflow` SA, Role and `minio-creds`, nothing in `argo` / `etl` touched; (4) Docker Desktop memory 8 GB -> 12 GB (owner's setting) and the fleet sizes either way; (5) image into kind by `docker save` -> `ctr import`, `imagePullPolicy: Never`; (6) image built offline from the wheelhouse, `httpfs` from a downloaded file, non-root; (7) Compose smoke without Jupyter; (8) `kubectl create` of a Workflow with `workflowTemplateRef` standing in for `argo submit`; (9) integration tier as planned, offline suite time not in scope; (10) benchmark method and when a default changes |
+| 6.1 | Worker memory check at start-up (`worker/memory.py`, wired into `serve`) | **done** | cgroup v2/v1 limit; unset -> limit minus 20% / at least 1 GiB; a given limit within 15% refused; `py_test/unit/test_worker_memory.py` (13) |
+| 6.2 | S3 upload part size on workers (`worker/runner.py`, `S3_MAX_FILE_SIZE = "50GB"`) | **done** | **found by the Compose smoke test:** httpfs's default part (800GB/10,000 = 76 MiB per open file) x 64 open shuffle files overran a 1 GiB worker; measured: 800GB / 80GB fail, 50GB passes; `py_test/unit/test_runner_s3.py` (3) |
+| 6.3 | Runtime image `deploy/Dockerfile` + `deploy/image/` + `scripts/image.ps1` | **done** | offline from the wheelhouse, httpfs 1.5.6 from a downloaded file, non-root 10001, 843 MB; `check_image.py` passes with `--network none`; `-Load` = docker save -> docker cp -> ctr import into `/var/tmp` of the node (its `/tmp` is a tmpfs `docker cp` cannot write into) |
+| 6.4 | Compose smoke test `deploy/docker-compose.yml` | **done** | 3 workers (2 GB limits) + driver: all 8 `smoke_cluster.py` queries equal to icetl |
+| 6.5 | `deploy/k8s/` (namespace, RBAC, model A `workers.yaml`, `node.sh`), `deploy/argo/fleet.yaml`, `scripts/k8s.ps1` | **done** | resources via `podSpecPatch` (the CRDs validate quantities); Secrets from `.env` over stdin (BOM and CRs stripped), RAM-only in the node; model A applied: **not yet** |
+| 6.6 | `scripts/fleet_check.py` on the Argo fleet (done-when) | **done** | `icefleet-fleet-w7cbb`, 2 workers x (2 Gi, 2 CPU), coordinator 2 Gi: aggregate 17.1 s (icetl 20.2 s), window 42.1 s (17.4 s), join 25.4 s (22.8 s), all equal to icetl, prefixes removed, no pod / Service left after 50 s. Same check on `local[3]` green |
+| 6.7 | Why distributed is slower (owner's question, 2026-11-26) | **measured** | `local[3]` warm, 64/16/8 partitions: join 11.0/7.4/7.0 s, window 13.7/11.5/12.5 s, icetl 1.1 / 4.0 s. Partitions explain a third of the join; the window's cost is shuffling ~41M rows through MinIO (decision 2; Phase 8's streaming exchange). The fleet numbers are cold single runs on 2 x 2 CPUs, its icetl column on a 2-CPU pod |
+| 6.8 | Model A check | **done** | StatefulSet up: pods Ready, DuckDB 1024 MiB from a 2 Gi limit, the headless Service resolves both, both answer `/ping`; taken down again |
+| 6.9 | `scripts/benchmark.py` + `docs/BENCHMARKS.md` | **done** | single / `local[3]` / fleet, each at 64 and 16 partitions (fleet runs `icefleet-fleet-m2w2v`, `-bh9t6`, both succeeded and left nothing) |
+| 6.10 | Integration tier `py_test/integration/` (guard, witness, reads, writes) + `scripts/integration.py` + Dockerfile `test` target | **written, not yet run** | 15 tests (12 bounded, 3 `slow`); deselected by the offline gate. **Next:** run on the host (`pytest -m "integration and not slow"`), then `image.ps1 -Test -Load` + `k8s.ps1 run integration.py image=icefleet-test:dev` |
+| 6.11 | Default from measurement | **done** | `icefleet.shuffle.partitions` 64 -> 16 (BENCHMARKS.md; plan §6 Phase 6 "As built", dated) |
+| 6.12 | Docs: plan "As built", README (Kubernetes and Argo), divergence, BENCHMARKS | **done** | |
+| 6.13 | Full gate | **done** | 2026-11-26: lint, type, py312 **872 passed** (3 min 24 s), dist; 216 s |
+| 6.14 | Committed | **done** | at the owner's request ("pls update benchmark.md and commit the chnages", 2026-11-26); not pushed |
+| 6.15 | Owner confirms Phase 6 | **pending** | after 6.10 |
+| 6.0a | Environment survey (read-only, 2026-11-26) | **done** | see "Environment facts" below: kind cluster with Argo v4.1.4 (cluster-wide controller), API port not mapped to the host since today's Docker restart; Docker Desktop Kubernetes not enabled; Docker VM 8 GB; no `kind` / `argo` CLI on Windows |
+
 
 
 ## Open decisions
@@ -190,6 +212,22 @@ Update at the end of every session. Design lives in
 ## Known gaps
 
 No known wrong answers. Limits by design and environment issues:
+
+- **kubectl from Windows cannot reach the kind cluster** (2026-11-26): its API port
+  49751 (and Argo's 2746) lie in a Windows excluded port range (49693-49792, Hyper-V /
+  WinNAT), so Docker publishes none of the node's ports, restart or not. `scripts\k8s.ps1`
+  runs kubectl inside the node instead, which needs nothing on the host. Freeing the range
+  (a `winnat` restart or a reboot) is the owner's call; the Argo UI is unreachable until then.
+- **Shuffle upload buffers** (Phase 6): even at S3's minimum part size (5 MB, set by the
+  worker) a shuffle task holds one open upload per partition, ~320 MB at 64 partitions,
+  per slot. A worker's DuckDB budget must cover `slots x partitions x 5 MB` plus its scan;
+  1 GiB with 2 slots and 64 partitions works (the Compose smoke test, the Argo fleet).
+- **The shuffle through MinIO dominates wide shuffles** (Phase 6 measurement): a window
+  over ~41M rows takes ~5x icetl's time on `local[3]`, mostly writing and reading the
+  shuffled rows. The streaming exchange is Phase 8 (decision 2).
+- **The image is 843 MB**: pyiceberg's `glue` / `hive` / `sql-sqlite` extras (boto3,
+  thrift, sqlalchemy) come with the declared dependency; trimming them is a dependency
+  decision, not an image one.
 
 - **Smart App Control blocks pyarrow on Windows**: `arrow_flight.dll` since Phase 0, and
   since a later re-check on 2026-11-15 also `_parquet` / `_dataset` (same files, verdict
@@ -270,7 +308,8 @@ No known wrong answers. Limits by design and environment issues:
 - **Shuffle files are not rolled** (DuckDB cannot combine `FILE_SIZE_BYTES` with
   `PARTITION_BY`): one file per task and partition, which is fine at 64 partitions and
   should be measured in Phase 6.
-- **Partition count is fixed per query** (`icefleet.shuffle.partitions`, 64): a
+- **Partition count is fixed per query** (`icefleet.shuffle.partitions`, 16 since
+  2026-11-26, 64 before): a
   high-cardinality key in a small query still writes up to splits × 64 small files.
   Adaptive coalescing is Phase 7; the default is Phase 6's to measure.
 - **Workers download DuckDB's `httpfs` on first object-store use** (`INSTALL httpfs`). In the
@@ -295,4 +334,6 @@ No known wrong answers. Limits by design and environment issues:
 | REST catalog | `http://localhost:8182` from Windows, `http://iceberg-rest:8181` in the dev container (namespaces `nyc`, `temporal_poc`; table `nyc.yellow_tripdata` -- the only one in `nyc` as of 2026-11-18; `yellow_tripdata_wide` is gone). Compose stack `iceberg-nyc` has **no restart policy**: after a Docker Desktop restart, `docker start` postgres, minio, iceberg-rest (and pgadmin) |
 | MinIO | `http://localhost:9100` from Windows, `http://minio:9000` in the dev container; path-style, `us-east-1`; credentials in `.env` |
 | Other clusters | a `kind` cluster `temporal-poc` runs in Docker, publishing 2746 (Argo Server's port). It may be a quicker Phase 6 target than Docker Desktop's Kubernetes; the owner decides at Phase 6 |
+| kind `temporal-poc` (checked 2026-11-26, read-only via `docker exec` into the node) | one node, Kubernetes v1.36.4, 8 CPU / ~7.7 GiB allocatable, restart policy `on-failure`, on Docker network `kind`; `host.docker.internal` resolves inside it. **Argo Workflows v4.1.4** (`argo-server`, `workflow-controller` in `argo`), **cluster-scoped** (ClusterRole bindings, no `--namespaced`); controller ConfigMap: workflow `parallelism: 2`, defaults SA `argo-workflow`, 30-day `ttlStrategy`, logs archived to MinIO `argo-artifacts` at `host.docker.internal:9100` with Secret `minio-creds`. Namespace `etl` holds the owner's icetl `WorkflowTemplate`s (`icetl-medallion`, `icetl-single-dq-check`, `icetl-single-step`). **Its host port mappings (6443 -> 127.0.0.1:49751, 32746 -> 2746) were not restored after today's Docker restart**: `kubectl --context kind-temporal-poc` from Windows is refused. No `kind` CLI and no `argo` CLI on Windows; `kubectl` v1.36.1 is Docker Desktop's |
+| Docker Desktop VM (2026-11-26) | 8 CPUs, **8 GB memory** (plan §6 Phase 6 assumed ~10 GB); its built-in Kubernetes is **not enabled** (only the `kind-temporal-poc` kube context exists) |
 | icetl checkout | `E:\workspace\Transformation_Engine_08172026` (uncommitted docs reorganisation in progress there) |

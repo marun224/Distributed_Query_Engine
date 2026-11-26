@@ -1,0 +1,65 @@
+# The ServiceAccount Argo's workflow pods run as in this namespace. The controller's
+# defaults name it `argo-workflow` (decision 29), so the name is kept and the template
+# names it too.
+#
+#   argo-executor   what Argo v4's executor needs to report a step's outputs
+#   icefleet-fleet  the fleet template's own steps: create and delete the per-workflow
+#                   headless Service its daemon workers sit behind (model B)
+#
+# Nothing here reaches outside the namespace; workers and the coordinator need no
+# Kubernetes API at all (k8s:// discovery is a DNS lookup, PLAN §3.5).
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: argo-workflow
+  namespace: icefleet
+  labels:
+    app.kubernetes.io/part-of: icefleet
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: argo-executor
+  namespace: icefleet
+rules:
+  - apiGroups: ["argoproj.io"]
+    resources: ["workflowtaskresults"]
+    verbs: ["create", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: icefleet-fleet
+  namespace: icefleet
+rules:
+  - apiGroups: [""]
+    resources: ["services"]
+    verbs: ["create", "get", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: argo-workflow-executor
+  namespace: icefleet
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: argo-executor
+subjects:
+  - kind: ServiceAccount
+    name: argo-workflow
+    namespace: icefleet
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: argo-workflow-fleet
+  namespace: icefleet
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: icefleet-fleet
+subjects:
+  - kind: ServiceAccount
+    name: argo-workflow
+    namespace: icefleet

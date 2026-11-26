@@ -1,0 +1,8 @@
+# icefleet's own namespace on the dev cluster (decision 29). Nothing of icefleet's lives
+# in `argo` or `etl`.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: icefleet
+  labels:
+    app.kubernetes.io/part-of: icefleet

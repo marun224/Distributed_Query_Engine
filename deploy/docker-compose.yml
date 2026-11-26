@@ -1,0 +1,64 @@
+# The local smoke test of the runtime image -- the test of the image, not a deployment
+# (PLAN §6 Phase 6, kickoff answer 7). Three workers and a driver that runs
+# scripts/smoke_cluster.py over static:// against the dev catalog (PLAN §3.4), every query
+# compared with icetl's own answer inside the driver.
+#
+#   .\scripts\image.ps1                                   build icefleet:dev first
+#   docker compose -f deploy/docker-compose.yml up --abort-on-container-exit --exit-code-from driver
+#   docker compose -f deploy/docker-compose.yml down
+#
+# Credentials come from the repo's .env, as for the dev container (decision 20); only the
+# two host names are overridden, because the catalog stack is reached by name on its
+# Docker network.
+
+name: icefleet-smoke
+
+x-worker: &worker
+  image: icefleet:dev
+  init: true
+  # A memory cgroup like a pod's: the worker keeps DuckDB at the limit minus 20% / 1 GiB
+  # (worker/memory.py), here 1 GiB.
+  mem_limit: 2g
+  command: ["serve", "--host", "0.0.0.0", "--port", "8815", "--slots", "2", "--threads", "2"]
+  env_file: ../.env
+  environment: &endpoints
+    ICETL_CATALOG_URI: http://iceberg-rest:8181
+    ICETL_S3_ENDPOINT: http://minio:9000
+  tmpfs:
+    - /spill:uid=10001,gid=10001
+  healthcheck:
+    test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8815/ping', timeout=2)"]
+    interval: 2s
+    timeout: 3s
+    retries: 30
+  networks: [default, catalog]
+
+services:
+  worker-1: *worker
+  worker-2: *worker
+  worker-3: *worker
+
+  driver:
+    image: icefleet:dev
+    init: true
+    entrypoint: ["python"]
+    command:
+      - /scripts/smoke_cluster.py
+      - --master
+      - static://worker-1:8815,worker-2:8815,worker-3:8815
+      - --exchange
+      - s3://icefleet-shuffle/smoke-compose
+    env_file: ../.env
+    environment: *endpoints
+    volumes:
+      - ../scripts:/scripts:ro
+    depends_on:
+      worker-1: { condition: service_healthy }
+      worker-2: { condition: service_healthy }
+      worker-3: { condition: service_healthy }
+    networks: [default, catalog]
+
+networks:
+  catalog:
+    name: ${ICEFLEET_DEV_CATALOG_NETWORK:-iceberg-nyc_iceberg_net}
+    external: true

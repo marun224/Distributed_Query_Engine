@@ -609,3 +609,109 @@ git commit                                    # "Phase 5b: row-level DELETE / UP
 git push origin main
 git ls-remote origin main                     # GitHub's main == local HEAD
 ```
+
+Owner: "Yes, start Phase 6" (2026-11-26) -- kickoff: reading plan §2, §3.5, §6 Phase 6-8, §8-9; read-only survey of the cluster side.
+
+```
+grep -n '^#' docs/PLAN_distributed_engine.md                 # plan sections
+which kubectl; kubectl version --client; kubectl config get-contexts   # only kind-temporal-poc; Docker Desktop Kubernetes not enabled
+docker info --format 'mem=... cpus=... server=...'           # 8 CPUs, 8 GB
+find deploy py_test -maxdepth 2 -type d; grep -rn integration pyproject.toml tox.ini   # no deploy/k8s, deploy/argo, py_test/integration yet
+kubectl --context kind-temporal-poc get nodes / ns / crd / deploy -A   # refused: 127.0.0.1:49751 (host port mapping lost after the Docker restart)
+docker inspect temporal-poc-control-plane --format '{{json .HostConfig.PortBindings}}'   # 6443 -> 49751, 32746 -> 2746 configured, not live
+docker exec temporal-poc-control-plane sh -c 'KUBECONFIG=/etc/kubernetes/admin.conf kubectl get ns; get deploy -A; get crd | grep argo'
+#   namespaces argo, etl, ...; argo-server + workflow-controller v4.1.4; Argo CRDs present
+which kind                                                   # none
+docker exec temporal-poc-control-plane sh -c '... kubectl -n argo get deploy (images); get nodes; node allocatable; getent hosts host.docker.internal'
+docker exec temporal-poc-control-plane sh -c '... controller/server args; clusterrolebindings; workflow-controller-configmap; workflowtemplates -A; sa -n etl'
+#   cluster-scoped controller; parallelism 2; default SA argo-workflow; logs to MinIO argo-artifacts; etl holds icetl templates
+# nothing changed on the cluster; tracker: Phase 6 checklist (6.0 kickoff, 6.0a survey), environment facts
+```
+
+Owner: "Yes to all" (2026-11-26) -- Phase 6 kickoff answers accepted; build starts.
+
+```
+# CORRECTION to the pre-push credential check above: its regex [A-Z_] skipped keys with digits
+# (ICETL_S3_ACCESS_KEY_ID / ICETL_S3_SECRET_ACCESS_KEY are in .env). Redone with [A-Z0-9_]:
+#   both values appear in no tracked file at HEAD and in no commit in `git log --all -S` -> nothing leaked
+docker info --format 'mem=...'                      # still 8 GB: the fleet is sized for 8 GB (answer 4)
+docker restart temporal-poc-control-plane           # answer 2; mappings still empty afterwards
+docker port temporal-poc-control-plane; docker inspect ... NetworkSettings.Ports   # {"6443/tcp":[],"32746/tcp":[]}
+Get-NetTCPConnection -LocalPort 49751,2746; netsh interface ipv4 show excludedportrange protocol=tcp
+#   49751 lies in a Windows (Hyper-V/WinNAT) excluded range 49693-49792: Docker cannot bind it and drops
+#   every host port of that container -> fallback: kubectl through `docker exec <node> kubectl`
+docker stats --no-stream                            # ~1.6 GiB used of 7.67 GiB
+docker exec temporal-poc-control-plane ... kubectl -n etl get role,rolebinding -o yaml; get secret   # argo-executor Role (workflowtaskresults create/patch)
+.\scripts\dev.ps1 uv run python -m pytest -q -p no:randomly py_test/unit/test_worker_memory.py   # 13 passed
+powershell -ExecutionPolicy Bypass -File .\scripts\image.ps1   # new: offline build, check_image OK, 843 MB
+#   httpfs.duckdb_extension.gz v1.5.6 linux_amd64 downloaded once into .wheelhouse\duckdb-extensions\ (Invoke-WebRequest)
+docker compose -f deploy/docker-compose.yml up --abort-on-container-exit --exit-code-from driver
+#   projection, aggregate, join-broadcast OK; join-shuffle FAILED: DuckDB OOM in a worker (1 GiB budget, 2 GiB cgroup):
+#   "could not allocate block of size 76.5 MiB" = httpfs part size 800GB/10,000 x 64 open shuffle files
+docker exec -i -w /work icefleet-dev python - < <scratchpad>/exp_s3_parts.py 3000000    # 64-way COPY to MinIO, 1GB: all ok
+docker exec -i -w /work icefleet-dev python - < <scratchpad>/exp_s3_parts.py 25000000   # 2 slots: 800GB FAIL, 80GB FAIL, 50GB ok
+docker exec -w /work icefleet-dev python -c '<s3fs: remove icefleet-shuffle/exp-*>'     # 7, then 6 prefixes removed
+#   -> worker/runner.py: SET GLOBAL s3_uploader_max_filesize = '50GB' once httpfs is loaded
+.\scripts\dev.ps1 uv run python -m pytest -q -p no:randomly py_test/unit/test_runner_s3.py py_test/unit/test_worker_memory.py py_test/unit/test_worker_server.py   # 26 passed
+docker compose -f deploy/docker-compose.yml down
+powershell -ExecutionPolicy Bypass -File .\scripts\image.ps1   # rebuilt
+docker compose -f deploy/docker-compose.yml up --abort-on-container-exit --exit-code-from driver   # all 8 queries OK, exit 0
+docker compose -f deploy/docker-compose.yml down
+```
+```
+.\scripts\dev.ps1 uv run python scripts/fleet_check.py --master local[3]   # new script: aggregate / window / join on ~41M rows, all equal to icetl
+powershell -File .\scripts\image.ps1 -LoadOnly       # ctr: open /tmp/...: no such file -- the node's /tmp is a tmpfs, docker cp writes under it
+docker exec temporal-poc-control-plane sh -c 'mount | grep ...'   # /tmp tmpfs, /var a volume -> node paths moved to /var/tmp/icefleet
+powershell -File .\scripts\image.ps1 -LoadOnly       # loaded icefleet:dev (211 MB in the node); version tag skipped: PS 5.1 stripped the
+#                                                      quotes of an `index` template -> labels read as JSON
+powershell -File .\scripts\k8s.ps1 setup             # WorkflowTemplate invalid: the CRDs validate resource quantities -> podSpecPatch
+powershell -File .\scripts\k8s.ps1 setup             # silent: the PowerShell function returned the command's output -> Out-Host
+powershell -File .\scripts\k8s.ps1 setup             # namespace, RBAC, template, 3 Secrets, ConfigMap
+powershell -File .\scripts\k8s.ps1 kubectl -n icefleet get secret ... -o go-template=<key names>   # catalog Secret lacked ICETL_CATALOG_NAME
+"ICETL_A=1`nICETL_B=2" | docker exec -i temporal-poc-control-plane od -c   # PowerShell prefixes a UTF-8 BOM -> stripped on both ends
+powershell -File .\scripts\k8s.ps1 secrets           # all five catalog keys
+powershell -File .\scripts\k8s.ps1 run fleet_check.py "script-args=--only aggregate"   # Succeeded in 80s, equal to icetl, nothing left
+powershell -File .\scripts\k8s.ps1 run fleet_check.py
+#   icefleet-fleet-w7cbb: aggregate 17.1s (icetl 20.2s), window 42.1s (17.4s), join 25.4s (22.8s) -- all equal to icetl,
+#   exchange prefixes removed, no pod and no Service left after 50s  => Phase 6 done-when (fleet part) met
+```
+Owner (mid-turn): "it is running for quite time, can we checking why taking more time"
+```
+docker exec -i -w /work icefleet-dev python - < <scratchpad>/exp_partitions.py   # local[3], best of 2 warm runs:
+#   aggregate 0.8 / 0.7 / 0.8 s at 64 / 16 / 8 partitions; window 13.7 / 11.5 / 12.5 s; join 11.0 / 7.4 / 7.0 s
+#   (icetl single-node in the same container: window 4.0 s, join 1.1 s) -> partitions explain a third of the join,
+#   little of the window: the cost is ~41M rows written to and read back from MinIO (decision 2; streaming is Phase 8)
+```
+
+Owner: "Yes, continue" (2026-11-26).
+
+```
+powershell -File .\scripts\k8s.ps1 workers up; ... kubectl -n icefleet rollout status statefulset/icefleet-worker
+powershell -File .\scripts\k8s.ps1 kubectl -n icefleet logs icefleet-worker-0            # memory_limit 1024MiB (2 Gi pod)
+powershell -File .\scripts\k8s.ps1 kubectl -n icefleet exec icefleet-worker-1 -- python -c "<resolve k8s://icefleet-workers..., GET /ping>"
+#   both pods listed by DNS, both answer the handshake  => model A works
+powershell -File .\scripts\k8s.ps1 workers down
+.\scripts\dev.ps1 uv run python scripts/benchmark.py --engine single --json .scratch/bench/1-single.json
+.\scripts\dev.ps1 uv run python scripts/benchmark.py --engine cluster --master local[3] --json .scratch/bench/2-local3.json
+.\scripts\dev.ps1 uv run python scripts/benchmark.py --engine cluster --master local[3] --conf icefleet.shuffle.partitions=16 --json .scratch/bench/3-local3-p16.json
+#   (background, one after another) medians single / local[3] p64 / p16:
+#   count 0.05/0.05/0.05  filtered 0.18/0.52/0.53  stream 1.31/3.03/4.25  aggregate 0.46/0.81/1.05
+#   join 0.86/11.58/8.01  window 3.05/16.18/15.94
+.\scripts\dev.ps1 uv run python -m ruff format <new files>; ruff check . --fix   # 8 fixed (import order, a stale noqa)
+powershell -File .\scripts\k8s.ps1 run benchmark.py "script-args=--engine cluster --label fleet"   (background, -> .scratch/bench/fleet-p64.log)
+powershell -File .\scripts\k8s.ps1 run benchmark.py "script-args=--engine cluster --label fleet --conf icefleet.shuffle.partitions=16"   (-> fleet-p16.log)
+```
+Owner: "pls update benchmark.md and commit the chnages" (2026-11-26).
+
+```
+powershell -File .\scripts\k8s.ps1 kubectl -n icefleet get wf,pods; ... logs -l icefleet.io/role=coordinator   # fleet p64 still running
+.\scripts\dev.ps1 uv run tox -e lint; .\scripts\dev.ps1 uv run tox -e type      # OK, OK
+#   fleet p64 (icefleet-fleet-m2w2v, 445 s) and p16 (icefleet-fleet-bh9t6, 360 s): Succeeded, nothing left behind
+grep -a '^BENCHMARK_JSON ' .scratch/bench/fleet-p{64,16}.log > .scratch/bench/{4-fleet,5-fleet-p16}.json
+docker exec -w /work icefleet-dev python scripts/benchmark.py --render <1..5>.json --markdown .scratch/bench/{results,partitions}.md
+#   -> docs/BENCHMARKS.md; py_src/icefleet/config.py shuffle_partitions 64 -> 16 (join -31% local[3], -36% fleet)
+.\scripts\dev.ps1 uv run tox                     # green: lint, type, py312, dist (216 s)
+.\scripts\dev.ps1 uv run python -m pytest -q --co   # 872/887 collected (15 integration deselected)
+git add -A -- .gitattributes README.md deploy docs py_src py_test scripts
+git commit                                       # Phase 6 (integration tier not yet run); not pushed
+```

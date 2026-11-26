@@ -1,0 +1,221 @@
+# Model B: a fleet per workflow (PLAN §3.5, the first Kubernetes target). One run:
+#
+#   1. service      a headless Service named after the workflow, selecting this run's
+#                   worker pods only (two runs at once never share workers)
+#   2. worker x N   `icefleet-worker serve` as Argo daemon steps: the workflow moves on
+#                   once every one is Ready (/ping), and Argo kills them when it ends
+#   3. coordinator  `python /jobs/<script>` from the ConfigMap icefleet-jobs, with
+#                   icefleet.master = k8s://<workflow>-workers.icefleet.svc:8815 -- the
+#                   same DNS discovery a standing fleet (model A) uses, nothing else
+#   onExit          the Service deleted; podGC removes the pods shortly after
+#
+# Submitted by scripts\k8s.ps1 run (a Workflow with workflowTemplateRef, created with
+# kubectl -- the stand-in for `argo submit`, decision 29). Memory follows §3.5: pod limits
+# are parameters, each worker sets DuckDB's budget to its limit minus 20% / at least 1 GiB
+# (worker/memory.py), and the coordinator's DuckDB gets an explicit budget.
+apiVersion: argoproj.io/v1alpha1
+kind: WorkflowTemplate
+metadata:
+  name: icefleet-fleet
+  namespace: icefleet
+  labels:
+    app.kubernetes.io/part-of: icefleet
+spec:
+  entrypoint: main
+  onExit: cleanup
+  serviceAccountName: argo-workflow
+  # The controller's defaults keep finished workflows for 30 days; this one goes sooner.
+  ttlStrategy:
+    secondsAfterCompletion: 86400
+  podGC:
+    strategy: OnWorkflowCompletion
+    deleteDelayDuration: 60s
+  arguments:
+    parameters:
+      - name: image
+        value: icefleet:dev
+      - name: workers
+        value: "2"
+      - name: worker-memory
+        value: 2Gi
+      - name: worker-memory-request
+        value: 1Gi
+      - name: worker-cpu
+        value: "2"
+      - name: slots
+        value: "2"
+      - name: coordinator-memory
+        value: 2Gi
+      - name: coordinator-duckdb-memory
+        value: 1GiB
+      - name: exchange
+        value: s3://icefleet-shuffle/argo
+      - name: script
+        value: fleet_check.py
+      - name: script-args
+        value: ""
+  templates:
+    - name: main
+      steps:
+        - - name: service
+            template: service
+        - - name: worker
+            template: worker
+            withSequence:
+              count: "{{workflow.parameters.workers}}"
+        - - name: coordinator
+            template: coordinator
+
+    - name: service
+      resource:
+        action: create
+        setOwnerReference: true
+        manifest: |
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: {{workflow.name}}-workers
+            labels:
+              app.kubernetes.io/part-of: icefleet
+              workflows.argoproj.io/workflow: {{workflow.name}}
+          spec:
+            clusterIP: None
+            selector:
+              icefleet.io/fleet: {{workflow.name}}
+            ports:
+              - name: http
+                port: 8815
+                targetPort: 8815
+
+    - name: worker
+      daemon: true
+      # Resources through podSpecPatch: the cluster's Argo CRDs validate quantities, so a
+      # {{parameter}} cannot stand in `resources:` itself.
+      podSpecPatch: |
+        containers:
+          - name: main
+            resources:
+              requests:
+                memory: "{{workflow.parameters.worker-memory-request}}"
+                cpu: "1"
+              limits:
+                memory: "{{workflow.parameters.worker-memory}}"
+                cpu: "{{workflow.parameters.worker-cpu}}"
+      metadata:
+        labels:
+          icefleet.io/fleet: "{{workflow.name}}"
+          icefleet.io/role: worker
+          app.kubernetes.io/name: icefleet-worker
+          app.kubernetes.io/part-of: icefleet
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+      container:
+        image: "{{workflow.parameters.image}}"
+        imagePullPolicy: Never
+        command: [icefleet-worker]
+        args:
+          - serve
+          - --host
+          - 0.0.0.0
+          - --port
+          - "8815"
+          - --slots
+          - "{{workflow.parameters.slots}}"
+          - --threads
+          - "{{workflow.parameters.worker-cpu}}"
+          - --log-level
+          - INFO
+        ports:
+          - name: http
+            containerPort: 8815
+        envFrom:
+          - secretRef:
+              name: icefleet-s3
+        readinessProbe:
+          httpGet: { path: /ping, port: 8815 }
+          periodSeconds: 2
+          failureThreshold: 60
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities: { drop: ["ALL"] }
+        volumeMounts:
+          - { name: spill, mountPath: /spill }
+          - { name: tmp, mountPath: /tmp }
+      volumes:
+        - name: spill
+          emptyDir: { sizeLimit: 10Gi }
+        - name: tmp
+          emptyDir: { sizeLimit: 1Gi }
+
+    - name: coordinator
+      podSpecPatch: |
+        containers:
+          - name: main
+            resources:
+              requests:
+                memory: "{{workflow.parameters.coordinator-memory}}"
+                cpu: "1"
+              limits:
+                memory: "{{workflow.parameters.coordinator-memory}}"
+                cpu: "2"
+      metadata:
+        labels:
+          icefleet.io/fleet: "{{workflow.name}}-coordinator"
+          icefleet.io/role: coordinator
+          app.kubernetes.io/part-of: icefleet
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+      container:
+        image: "{{workflow.parameters.image}}"
+        imagePullPolicy: Never
+        command: [sh, -c]
+        args: ["exec python /jobs/{{workflow.parameters.script}} {{workflow.parameters.script-args}}"]
+        env:
+          - name: ICEFLEET_MASTER
+            value: "k8s://{{workflow.name}}-workers.{{workflow.namespace}}.svc:8815"
+          - name: ICEFLEET_EXPECT_WORKERS
+            value: "{{workflow.parameters.workers}}"
+          - name: ICEFLEET_EXCHANGE_LOCATION
+            value: "{{workflow.parameters.exchange}}"
+          - name: ICETL_DUCKDB_MEMORY_LIMIT
+            value: "{{workflow.parameters.coordinator-duckdb-memory}}"
+          - name: ICEFLEET_RUN_ID
+            value: "{{workflow.name}}"
+        envFrom:
+          - secretRef:
+              name: icefleet-s3
+          - secretRef:
+              name: icefleet-catalog
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities: { drop: ["ALL"] }
+        volumeMounts:
+          - { name: jobs, mountPath: /jobs, readOnly: true }
+          - { name: spill, mountPath: /spill }
+          - { name: tmp, mountPath: /tmp }
+      volumes:
+        - name: jobs
+          configMap:
+            name: icefleet-jobs
+        - name: spill
+          emptyDir: { sizeLimit: 10Gi }
+        - name: tmp
+          emptyDir: { sizeLimit: 1Gi }
+
+    - name: cleanup
+      resource:
+        action: delete
+        flags: ["--ignore-not-found"]
+        manifest: |
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: {{workflow.name}}-workers

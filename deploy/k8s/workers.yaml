@@ -1,0 +1,85 @@
+# Model A: a standing worker fleet behind a headless Service (PLAN §3.5), for interactive
+# use -- a notebook or script anywhere that can resolve the Service connects with
+#
+#   icefleet.master = k8s://icefleet-workers.icefleet.svc:8815
+#
+# Not applied by default (it holds memory while idle): .\scripts\k8s.ps1 workers up|down.
+# Memory follows §3.5: the pod limit is DuckDB's budget plus 20% / at least 1 GiB, and the
+# worker sets that budget itself from the cgroup limit (worker/memory.py), refusing a
+# --memory-limit within 15% of it. Spill goes to an emptyDir; --threads matches the CPU.
+apiVersion: v1
+kind: Service
+metadata:
+  name: icefleet-workers
+  namespace: icefleet
+  labels:
+    app.kubernetes.io/part-of: icefleet
+spec:
+  clusterIP: None
+  selector:
+    icefleet.io/fleet: standing
+  ports:
+    - name: http
+      port: 8815
+      targetPort: 8815
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: icefleet-worker
+  namespace: icefleet
+  labels:
+    app.kubernetes.io/part-of: icefleet
+spec:
+  serviceName: icefleet-workers
+  replicas: 2
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels:
+      icefleet.io/fleet: standing
+  template:
+    metadata:
+      labels:
+        icefleet.io/fleet: standing
+        app.kubernetes.io/name: icefleet-worker
+        app.kubernetes.io/part-of: icefleet
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+      terminationGracePeriodSeconds: 10
+      containers:
+        - name: worker
+          image: icefleet:dev
+          imagePullPolicy: Never
+          args: ["serve", "--host", "0.0.0.0", "--port", "8815", "--slots", "2", "--threads", "2"]
+          ports:
+            - name: http
+              containerPort: 8815
+          envFrom:
+            - secretRef:
+                name: icefleet-s3
+          resources:
+            requests: { memory: 1Gi, cpu: "1" }
+            limits: { memory: 2Gi, cpu: "2" }
+          readinessProbe:
+            httpGet: { path: /ping, port: 8815 }
+            periodSeconds: 2
+          livenessProbe:
+            httpGet: { path: /ping, port: 8815 }
+            periodSeconds: 10
+            failureThreshold: 6
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+          volumeMounts:
+            - { name: spill, mountPath: /spill }
+            - { name: tmp, mountPath: /tmp }
+      volumes:
+        - name: spill
+          emptyDir: { sizeLimit: 10Gi }
+        - name: tmp
+          emptyDir: { sizeLimit: 1Gi }

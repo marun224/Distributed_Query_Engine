@@ -70,6 +70,8 @@ def _serve(args: argparse.Namespace) -> int:
     from icetl.conf import EngineSettings, IcetlConf, resolve_settings
     from icetl.exec.engine import DuckDBEngine
 
+    from icefleet.errors import ClusterConfigurationError
+    from icefleet.worker.memory import cgroup_memory_limit, check_memory_limit
     from icefleet.worker.runner import TaskRunner
     from icefleet.worker.server import WorkerServer
 
@@ -79,9 +81,18 @@ def _serve(args: argparse.Namespace) -> int:
         return 2
 
     settings = resolve_settings(IcetlConf())
+    try:
+        # In a pod, DuckDB over the container's limit is an OOMKill with no message
+        # (PLAN §3.5): keep it under, or refuse to start.
+        memory_limit = check_memory_limit(
+            args.memory_limit or settings.engine.memory_limit, cgroup_memory_limit()
+        )
+    except ClusterConfigurationError as exc:
+        print(f"icefleet-worker: {exc}", file=sys.stderr)
+        return 2
     engine_settings = EngineSettings(
         threads=args.threads if args.threads is not None else settings.engine.threads,
-        memory_limit=args.memory_limit or settings.engine.memory_limit,
+        memory_limit=memory_limit,
         temp_directory=args.temp_dir or settings.engine.temp_directory,
     )
     engine = DuckDBEngine(replace(settings, engine=engine_settings))
@@ -100,7 +111,8 @@ def _serve(args: argparse.Namespace) -> int:
 
     signal.signal(signal.SIGTERM, stop)
     print(
-        f"icefleet-worker {__version__} listening on {server.endpoint}, {args.slots} slot(s)",
+        f"icefleet-worker {__version__} listening on {server.endpoint}, {args.slots} slot(s), "
+        f"memory_limit {memory_limit or 'DuckDB default'}",
         file=sys.stderr,
         flush=True,
     )

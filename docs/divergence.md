@@ -57,3 +57,10 @@ Not divergences, by construction:
 - **`x IN (SELECT y ...)`** (Phase 3) runs as a semi join on `x = y`. In a WHERE, NULL and
   false both drop the row, so the two agree on every input, NULLs included
   (`test_rel.py::test_the_semi_join_returns_what_in_returns_nulls_included`).
+- **Where the workers run** (Phase 6) changes nothing in the answer: the same image, the
+  same locked DuckDB (the handshake refuses another), the same plans on `local[N]`, Compose
+  and an Argo fleet. What a pod adds is a memory ceiling: a worker keeps DuckDB under its
+  container's limit with 20% (at least 1 GiB) to spare, so a query too large for the
+  fleet's memory normally spills or fails with DuckDB's out-of-memory error rather than a
+  silently killed worker; memory used outside DuckDB (Python, Arrow) is what the headroom
+  covers, and is not otherwise bounded.

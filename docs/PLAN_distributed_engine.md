@@ -103,6 +103,7 @@ an edit.
 | 26 | **Control plane: HTTP/JSON on the Python standard library, not Arrow Flight** *(added 2026-11-15, after Phase 0 found the dev machine blocks Flight)* | Windows Smart App Control runs in enforce mode on the dev machine and refuses pyarrow's unsigned `arrow_flight.dll`; it has no per-file allow-list, only a permanent off switch, which is the owner's security setting and not this project's to flip. So workers serve a stdlib `ThreadingHTTPServer` (`GET /ping`, `POST /tasks`, `POST /cancel`) and the coordinator calls them with `urllib`: nothing new to install, debuggable with curl, loads everywhere. Phase 8's fast data plane becomes **Arrow IPC streams over HTTP**; Flight stays a drop-in alternative on machines where it imports. `python -m <tool>` is used throughout the gate for the same reason (the unsigned `mypy.exe` launcher is blocked, the module form is not). |
 | 27 | **Kubernetes with Argo Workflows is the real deployment target** *(added 2026-11-15, at the owner's request; supersedes decision 4's VMs)* | One image and one task format serve three ways of running on Kubernetes (§3.5): **A** a standing worker fleet behind a headless Service, found by `k8s://` discovery; **B** a fleet per workflow — worker pods as Argo *daemon steps*, the coordinator as the next step — which is the **first target** because it needs nothing beyond that discovery; **C** a pod per task — an `ArgoScheduler` that turns one query into one Workflow — which is **Phase 6b**, a second scheduler backend beside the thread pool. The scheduler therefore becomes a protocol with two implementations rather than one class. Docker Compose stays only as the local smoke test of the image. Dev cluster: **Docker Desktop's built-in Kubernetes** (owner agreed 2026-11-15: no new unsigned binaries for Smart App Control to block, local images visible to pods without a registry, dev MinIO and catalog reachable as `host.docker.internal`), with Argo Workflows installed from its release manifests; `kind` is the drop-in for multi-node or CI since the manifests are plain Kubernetes. Helm is deferred; plain manifests first. |
 | 28 | **Development runs in a Linux dev container** *(added 2026-11-15, after Smart App Control began blocking pyarrow's Parquet and Dataset modules on the dev machine, which stops `icetl.sql` importing; owner approved [PLAN_linux_dev_environment.md](PLAN_linux_dev_environment.md))* | `deploy/dev/` defines it and `scripts\dev.ps1` drives it from Windows. The repo is mounted at `/work`; the venv (`/opt/venv`), uv cache and tox envs are container-local volumes. The gate is authoritative only there; the Windows `.venv` is editor-only. The container joins the dev catalog's Docker network (`iceberg-rest:8181`, `minio:9000`). Because container downloads are intermittently unreliable on this machine, `setup` falls back to a wheelhouse of the exact locked Linux wheels downloaded on Windows (`scripts\wheelhouse.ps1`). The Phase 6 runtime image (`deploy/Dockerfile`) shares the base image but is a separate file. Decision 26 stands: the design must not depend on where the coordinator runs. |
+| 29 | **Dev Kubernetes cluster: the existing `kind` cluster `temporal-poc`, not Docker Desktop's Kubernetes** *(added 2026-11-26, Phase 6 kickoff; supersedes decision 27's choice of dev cluster only)* | It already runs Argo Workflows v4.1.4 with a cluster-scoped controller and the owner's icetl templates (namespace `etl`); Docker Desktop's Kubernetes was never enabled and would be a second cluster in the same 8 GB VM. icefleet lives in its own namespace `icefleet` with its own `argo-workflow` ServiceAccount, Role and `minio-creds` Secret, so the controller's defaults work unchanged; `argo`, `etl` and the controller's ConfigMap are not touched. Images go in with `docker save` → `ctr import` on the node (`imagePullPolicy: Never`, no registry, no `kind` CLI). Workflows are submitted with `kubectl create` and a `workflowTemplateRef` (no `argo` CLI). The manifests stay plain Kubernetes, so Docker Desktop's cluster or another `kind` remains a drop-in. |
 
 ---
 
@@ -917,6 +918,71 @@ a feeling.
 - Dev cluster prerequisite before this phase starts: Kubernetes enabled in Docker Desktop (decision 27), Docker Desktop given ~10 GB so the existing MinIO/catalog containers and the worker pods fit, Argo Workflows installed with `kubectl apply` of its release manifest. Docker Desktop's signed `kubectl` is enough; the `argo` CLI is optional (REST submission).
 
 **Done when:** `argo submit` of the fleet template runs the 41M-row aggregate, window and join end to end on the dev cluster with answers equal to icetl's, the daemon pods are gone afterwards, the exchange prefix is gone, and the benchmark file records the ratio to single-node.
+
+**As built (in progress, from 2026-11-26).**
+
+- **Kickoff answers (owner, "yes to all", 2026-11-26):** (1) the dev cluster is kind
+  `temporal-poc` (decision 29); (2) its host port mappings, lost in a Docker restart, are
+  restored by one `docker restart` of its node, `docker exec` the fallback; (3) a namespace
+  `icefleet` of its own (its own `argo-workflow` SA, Role, `minio-creds`), nothing in
+  `argo` / `etl` or the controller ConfigMap touched, our templates setting their own
+  `ttlStrategy` / `podGC` (the controller allows 2 workflows at once); (4) Docker
+  Desktop's memory is the owner's setting: at 12 GB the fleet is 3 workers × 1.5 GiB
+  DuckDB (2.5 GiB pods) + a 2 GiB coordinator, at 8 GB 2 workers × 1 GiB (2 GiB pods) + a
+  1.5 GiB coordinator; (5) images loaded by `docker save` → `ctr -n k8s.io images import`,
+  tagged `<version>-<git sha>`, `imagePullPolicy: Never`; (6) the image built offline
+  from the wheelhouse (exact locked wheels), `httpfs` 1.5.6 installed from a file
+  downloaded on Windows, the dev container's pinned base, non-root, `LOAD httpfs` checked
+  with networking off; (7) the Compose smoke test is 3 workers + a driver running
+  `smoke_cluster.py` over `static://`, no Jupyter; (8) `kubectl create` of a Workflow
+  with `workflowTemplateRef`, wrapped in `scripts/argo_run.ps1`, stands in for `argo
+  submit`, the coordinator's script from a ConfigMap; (9) the integration tier as above,
+  the offline suite's time not in scope; (10) benchmarks: icetl's queries plus join and
+  window cases on 41M rows, 1 warm-up + 3 timed runs, median, single-node vs `local[3]`
+  vs the Argo fleet, on one 8-core machine (ratios show overhead, not scale-out); a
+  default changes only where a measurement clearly wins, with a dated note here.
+- **The dev cluster's API port is unreachable from Windows:** port 49751 lies in a Windows
+  excluded range (Hyper-V / WinNAT), so Docker publishes none of the kind node's ports.
+  `scripts/k8s.ps1` therefore runs the node's own `kubectl` through `docker exec`, with
+  `deploy/k8s/node.sh` inside the node doing everything that needs quoting; files go to
+  `/var/tmp/icefleet` (the node's `/tmp` is a tmpfs `docker cp` cannot write into).
+  Secrets travel from `.env` over stdin, are held in `/dev/shm` and removed; only
+  `localhost` / `127.0.0.1` are rewritten to `host.docker.internal`.
+- **Image** (`deploy/Dockerfile`, `scripts/image.ps1`): two stages, the venv built from the
+  wheelhouse with `uv pip install --offline` against `uv export --frozen --no-dev`, then
+  copied onto the same pinned base; non-root (10001); `httpfs` installed from the staged
+  file into the user's extension directory; 843 MB (pyiceberg's declared extras). A
+  `test` target adds pytest and `py_test` for the in-cluster integration run. The check
+  (`deploy/image/check_image.py`) runs with `--network none`.
+- **Two engine changes**, both found by running in containers: (1) the worker's memory
+  check at start-up (`worker/memory.py`, §3.5's rule; DuckDB's budget defaults to the
+  cgroup limit minus 20% / at least 1 GiB); (2) **S3 upload parts**
+  (`worker/runner.py`): httpfs sizes a part as `s3_uploader_max_filesize` / 10,000, 76 MiB
+  by default, and a shuffle task keeps one upload open per partition -- 64 of them
+  overran a 1 GiB worker in the Compose smoke test. Measured (64-way COPY of 25M rows, 2
+  slots, 1 GB): 800GB and 80GB fail, 50GB (5 MB parts, S3's minimum) passes; workers set
+  50GB once httpfs is loaded.
+- **Argo specifics:** the cluster's CRDs validate resource quantities, so the fleet
+  template sets resources through `podSpecPatch`; the per-run headless Service is a
+  `resource` step (owner reference to the workflow) and is deleted by `onExit`;
+  `podGC: OnWorkflowCompletion` with a 60 s delay leaves time to read the coordinator's
+  log; the coordinator waits until DNS lists all N daemons (`ICEFLEET_EXPECT_WORKERS`).
+- **Done-when run** (`scripts/fleet_check.py`, workflow `icefleet-fleet-w7cbb`, 2 workers
+  x 2 Gi / 2 CPU, coordinator 2 Gi): aggregate 17.1 s, window 42.1 s, join 25.4 s (cold,
+  one run each), all equal to icetl computed in the same pod, every exchange prefix
+  removed, no pod and no Service left 50 s after the end. Model A: the StatefulSet's pods
+  set DuckDB to 1024 MiB from their 2 Gi limit, and the headless Service resolves to both.
+- **Benchmarks** (`scripts/benchmark.py`, [BENCHMARKS.md](BENCHMARKS.md)): icetl's cases
+  (count, filtered, stream, aggregate, join) on `nyc.yellow_tripdata` plus the window;
+  single-node vs `local[3]` vs the fleet, one machine, so the ratios are overhead.
+  Scans and narrow aggregates cost 1-3x; wide shuffles (join, window) 5-36x, the cost of
+  the exchange through MinIO (Phase 8).
+- **Default changed, 2026-11-26: `icefleet.shuffle.partitions` 64 -> 16.** Measured on both
+  engines: join 11.58 -> 8.01 s (`local[3]`) and 31.37 -> 20.17 s (fleet), window 46.47 ->
+  39.91 s (fleet), the rest within noise; it also cuts a shuffle task's open S3 uploads from
+  64 to 16. Split size, broadcast threshold, slots, compression and pod headroom were not
+  changed: nothing measured in Phase 6 clearly beat them. This supersedes the 64 of Phase
+  2's kickoff answer 3 (the placeholder it was meant to be).
 
 ### Phase 6b — Argo as a scheduler backend (pod per task)
 
