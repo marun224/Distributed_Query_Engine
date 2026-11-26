@@ -715,3 +715,20 @@ docker exec -w /work icefleet-dev python scripts/benchmark.py --render <1..5>.js
 git add -A -- .gitattributes README.md deploy docs py_src py_test scripts
 git commit                                       # Phase 6 (integration tier not yet run); not pushed
 ```
+Owner: "Yes, run it" (2026-11-26) -- the integration tier's first runs.
+
+```
+.\scripts\dev.ps1 uv run python -m pytest -m 'integration and not slow' py_test/integration -p no:randomly -q -rs   # 12 passed, 58 s
+.\scripts\dev.ps1 uv run python -m pytest -m 'integration and slow' py_test/integration -p no:randomly -q -rs       # 3 passed, 37 s
+powershell -File .\scripts\image.ps1 -Test -Load   # icefleet:0.0.1-7322614 + icefleet-test:0.0.1-7322614 (and :dev) into the node
+powershell -File .\scripts\k8s.ps1 run integration.py image=icefleet-test:dev                       # icefleet-fleet-phwxz: 12 passed, nothing left
+powershell -File .\scripts\k8s.ps1 run integration.py image=icefleet-test:dev "script-args=-m slow"  # icefleet-fleet-f9wc8: 3 passed, nothing left
+```
+Owner: "Confirm, commit + push" (2026-11-26) -- Phase 6 confirmed.
+
+```
+git add -- docs/task_tracker.md docs/commands.md
+git commit                                       # "Phase 6 confirmed: integration tier green, tracker"
+git push origin main
+git ls-remote origin main                        # GitHub's main == local HEAD
+```
